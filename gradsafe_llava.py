@@ -89,6 +89,26 @@ class GradSafeLLaVA:
                 print(f"Warning: Failed to load gradients from cache: {e}")
         return None
 
+    def _save_cosine_similarities_to_cache(self, sample_hash, cosine_similarities):
+        """Save cosine similarities to cache file (much smaller than gradients)"""
+        cache_file = os.path.join(self.cache_dir, f"cosines_{sample_hash}.pkl")
+        try:
+            with open(cache_file, 'wb') as f:
+                pickle.dump(cosine_similarities, f)
+        except Exception as e:
+            print(f"Warning: Failed to save cosine similarities to cache: {e}")
+
+    def _load_cosine_similarities_from_cache(self, sample_hash):
+        """Load cosine similarities from cache file"""
+        cache_file = os.path.join(self.cache_dir, f"cosines_{sample_hash}.pkl")
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'rb') as f:
+                    return pickle.load(f)
+            except Exception as e:
+                print(f"Warning: Failed to load cosine similarities from cache: {e}")
+        return None
+
     def _save_safety_score_to_cache(self, sample_hash, score):
         """Save safety score to cache file"""
         cache_file = os.path.join(self.cache_dir, f"score_{sample_hash}.pkl")
@@ -425,9 +445,8 @@ class GradSafeLLaVA:
             if images is not None:
                 del images
 
-            # Save to cache if enabled
-            if use_cache and gradients:
-                self._save_gradients_to_cache(sample_hash, gradients)
+            # Don't cache gradients - they're too large!
+            # We cache cosine similarities instead in compute_safety_score
 
             return gradients
 
@@ -608,7 +627,7 @@ class GradSafeLLaVA:
 
     def compute_safety_score(self, sample, reference_gradients, row_cosine_gaps, col_cosine_gaps, use_cache=True):
         """
-        Compute safety score for a single sample with caching
+        Compute safety score for a single sample with efficient caching
 
         Args:
             sample: Sample to evaluate (dict with 'txt' and 'img' keys)
@@ -621,12 +640,21 @@ class GradSafeLLaVA:
             float: Safety score (higher = more likely unsafe)
         """
         try:
-            # Check cache first
+            # Check cache first for final score
             if use_cache:
                 sample_hash = self._get_sample_hash(sample, "Sure")
                 cached_score = self._load_safety_score_from_cache(sample_hash)
                 if cached_score is not None:
                     return cached_score
+
+                # Check if we have cached cosine similarities
+                cached_cosines = self._load_cosine_similarities_from_cache(sample_hash)
+                if cached_cosines is not None:
+                    # Compute score from cached cosine similarities
+                    safety_score = sum(cached_cosines) / len(cached_cosines) if cached_cosines else 0.0
+                    # Cache the final score too
+                    self._save_safety_score_to_cache(sample_hash, safety_score)
+                    return safety_score
 
             # Validate inputs
             if sample is None:
@@ -637,8 +665,8 @@ class GradSafeLLaVA:
                 print("Warning: No reference gradients provided")
                 return 0.0
 
-            # Compute gradients for the sample
-            gradients = self._process_sample_for_gradient(sample, "Sure", use_cache=use_cache)
+            # Compute gradients for the sample (don't cache gradients, they're too big)
+            gradients = self._process_sample_for_gradient(sample, "Sure", use_cache=False)
 
             if not gradients:
                 return 0.0
@@ -687,8 +715,9 @@ class GradSafeLLaVA:
         else:
             safety_score = 0.0
 
-        # Save to cache if enabled
+        # Cache both cosine similarities and final score if enabled
         if use_cache:
+            self._save_cosine_similarities_to_cache(sample_hash, cosine_similarities)
             self._save_safety_score_to_cache(sample_hash, safety_score)
 
         # Cleanup after computation
@@ -728,7 +757,9 @@ class GradSafeLLaVA:
         if use_cache:
             for sample in samples:
                 sample_hash = self._get_sample_hash(sample, "Sure")
-                if self._load_safety_score_from_cache(sample_hash) is not None:
+                # Check for either final score or cosine similarities
+                if (self._load_safety_score_from_cache(sample_hash) is not None or
+                    self._load_cosine_similarities_from_cache(sample_hash) is not None):
                     cached_count += 1
             print(f"Found {cached_count}/{len(samples)} samples already cached")
 
