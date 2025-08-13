@@ -148,15 +148,15 @@ class BenchmarkEvaluator:
             print("Using default samples for parameter identification")
 
         return self.gradsafe.find_critical_parameters(unsafe_samples, safe_samples)
-    
-    def evaluate_on_test_set(self, test_data, reference_gradients, row_cosine_gaps, col_cosine_gaps,
-                           use_cache=True, cooling_interval=10, cooling_time=60):
+
+    def evaluate_on_test_set(self, test_data, gradient_norms_compare, minus_row_cos, minus_col_cos,
+                           use_cache=True, cooling_interval=20, cooling_time=20):
         """Evaluate GradSafe on test set with caching and cooling"""
         print("Evaluating GradSafe on test set...")
 
         # Compute safety scores and predictions
         safety_scores, predictions, labels = self.gradsafe.evaluate_samples(
-            test_data, reference_gradients, row_cosine_gaps, col_cosine_gaps,
+            test_data, gradient_norms_compare, minus_row_cos, minus_col_cos,
             use_cache=use_cache, cooling_interval=cooling_interval, cooling_time=cooling_time
         )
 
