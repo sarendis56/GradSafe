@@ -9,6 +9,10 @@ This script:
 4. Reports results
 
 Usage:
+    # Quick test (200 samples from XSTest):
+    python run_gradsafe_evaluation.py --quick_test
+
+    # Full benchmark (1800 samples):
     python run_gradsafe_evaluation.py [--model_path MODEL_PATH] [--use_training_data] [--output_file OUTPUT_FILE]
 """
 
@@ -61,8 +65,10 @@ def main():
                         help='Output file for results')
     parser.add_argument('--skip_env_check', action='store_true',
                         help='Skip conda environment check')
-    parser.add_argument('--optimize_threshold', action='store_true',
-                        help='Find and use optimal threshold instead of default 0.25')
+    parser.add_argument('--quick_test', action='store_true',
+                        help='Run quick test on 100+100 XSTest samples instead of full 1800 samples')
+    # parser.add_argument('--optimize_threshold', action='store_true',
+    #                     help='Find and use optimal threshold instead of default 0.25')
     parser.add_argument('--disable_cache', action='store_true',
                         help='Disable caching of gradients and scores')
     parser.add_argument('--cooling_interval', type=int, default=10,
@@ -121,7 +127,7 @@ def main():
             training_data = None
             print("Using default samples for critical parameter identification")
         
-        test_data = evaluator.load_test_datasets()
+        test_data = evaluator.load_test_datasets(quick_test=args.quick_test)
         
         load_time = time.time() - start_time
         print(f"Dataset loading completed in {load_time:.2f} seconds")
