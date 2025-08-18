@@ -80,11 +80,18 @@ class BenchmarkEvaluator:
         malicious_train = advbench_data + jailbreak_llm_data + jailbreak_query_data + dan_data
         print(f"Loaded {len(malicious_train)} malicious training samples")
         
-        # Combine and shuffle
+        # Combine datasets in deterministic, interpretable order
         training_data = benign_train + malicious_train
-        random.shuffle(training_data)
         
         print(f"Total training samples: {len(training_data)}")
+        print("Training dataset composition:")
+        print(f"  - Alpaca: {len(alpaca_data)} samples")
+        print(f"  - MM-Vet: {len(mmvet_data)} samples")
+        print(f"  - OpenAssistant: {len(openassistant_data)} samples")
+        print(f"  - AdvBench: {len(advbench_data)} samples")
+        print(f"  - JailBreakV llm_transfer: {len(jailbreak_llm_data)} samples")
+        print(f"  - JailBreakV query_related: {len(jailbreak_query_data)} samples")
+        print(f"  - DAN prompts: {len(dan_data)} samples")
         return training_data
     
     def load_test_datasets(self, quick_test=False):
@@ -104,11 +111,13 @@ class BenchmarkEvaluator:
             print(f"Loaded {len(xstest_safe)} safe test samples (XSTest)")
             print(f"Loaded {len(xstest_unsafe)} unsafe test samples (XSTest)")
 
-            # Combine and shuffle
+            # Combine datasets in deterministic, interpretable order
             test_data = xstest_safe + xstest_unsafe
-            random.shuffle(test_data)
 
             print(f"Total test samples: {len(test_data)} (QUICK TEST)")
+            print("Dataset composition:")
+            print(f"  - XSTest safe: {len(xstest_safe)} samples")
+            print(f"  - XSTest unsafe: {len(xstest_unsafe)} samples")
             return test_data
 
         else:
@@ -140,11 +149,18 @@ class BenchmarkEvaluator:
             unsafe_test = xstest_unsafe + figtxt_unsafe + vae_data + jailbreak_figstep_data
             print(f"Loaded {len(unsafe_test)} unsafe test samples")
 
-            # Combine and shuffle
+            # Combine datasets in deterministic, interpretable order
             test_data = safe_test + unsafe_test
-            random.shuffle(test_data)
-
+            
             print(f"Total test samples: {len(test_data)}")
+            print("Dataset composition:")
+            print(f"  - XSTest safe: {len(xstest_safe)} samples")
+            print(f"  - FigTxt safe: {len(figtxt_safe)} samples") 
+            print(f"  - VQAv2: {len(vqav2_data)} samples")
+            print(f"  - XSTest unsafe: {len(xstest_unsafe)} samples")
+            print(f"  - FigTxt unsafe: {len(figtxt_unsafe)} samples")
+            print(f"  - VAE adversarial: {len(vae_data)} samples")
+            print(f"  - JailBreakV figstep: {len(jailbreak_figstep_data)} samples")
             return test_data
     
     def initialize_gradsafe(self):
