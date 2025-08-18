@@ -73,8 +73,8 @@ def main():
                         help='Disable caching of gradients and scores')
     parser.add_argument('--cooling_interval', type=int, default=10,
                         help='Number of samples to process before cooling break (default: 10)')
-    parser.add_argument('--cooling_time', type=int, default=60,
-                        help='Cooling break duration in seconds (default: 60)')
+    parser.add_argument('--cooling_time', type=int, default=30,
+                        help='Cooling break duration in seconds (default: 30)')
     
     args = parser.parse_args()
     

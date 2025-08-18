@@ -59,7 +59,7 @@ python run_gradsafe_evaluation.py [--model_path MODEL_PATH] [--use_training_data
 - `--quick_test`: Run quick test on 100+100 XSTest samples
 - `--disable_cache`: Disable caching of gradients and scores
 - `--cooling_interval`: Samples before cooling break (default: 10)
-- `--cooling_time`: Cooling break duration in seconds (default: 60)
+- `--cooling_time`: Cooling break duration in seconds (default: 30)
 
 ### Benchmark Datasets
 

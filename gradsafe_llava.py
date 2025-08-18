@@ -438,9 +438,11 @@ class GradSafeLLaVA:
             self.model.train()
             self.model.requires_grad_(True)
 
-            # Forward pass with gradient checkpointing if available
-            if hasattr(self.model, 'gradient_checkpointing_enable'):
-                self.model.gradient_checkpointing_enable()
+            # Disable gradient checkpointing for GradSafe (we need actual gradients)
+            if hasattr(self.model, 'gradient_checkpointing_disable'):
+                self.model.gradient_checkpointing_disable()
+            elif hasattr(self.model, 'gradient_checkpointing') and self.model.gradient_checkpointing:
+                self.model.gradient_checkpointing = False
 
             try:
                 # Validate inputs before forward pass
@@ -540,56 +542,66 @@ class GradSafeLLaVA:
 
         print(f"Computing reference gradients from {len(unsafe_samples)} unsafe samples...")
         print("Following EXACT original GradSafe implementation...")
+        print("Optimized: Processing each sample only once (no redundant gradient computation)")
 
-        # Step 1: Calculate the average of unsafe prompts gradients as reference
-        # EXACT variable name from original: gradient_norms_compare
+        # Step 1 & 2: Process unsafe samples once and compute both reference gradients and cosine similarities
+        # EXACT variable names from original: gradient_norms_compare, row_coss, col_coss
         gradient_norms_compare = {}
+        row_coss = {}
+        col_coss = {}
+        unsafe_gradients_cache = {}  # Cache gradients to avoid recomputation
 
-        for sample in unsafe_samples:
-            print(f"Processing unsafe sample: {sample['txt'][:50]}...")
+        for i, sample in enumerate(unsafe_samples):
+            print(f"Processing unsafe sample {i+1}/{len(unsafe_samples)}: {sample['txt'][:50]}...")
             gradients = self._process_sample_for_gradient(sample, "Sure")
 
             if gradients:
+                # Cache gradients for step 2
+                unsafe_gradients_cache[i] = gradients
+
+                # Step 1: Accumulate reference gradients
                 for name, grad in gradients.items():
                     if name not in gradient_norms_compare:
                         gradient_norms_compare[name] = grad.clone()
                     else:
                         gradient_norms_compare[name] += grad
+
                 self._aggressive_cleanup()
 
         # Average the reference gradients - EXACT from original
+        print(f"Averaging reference gradients across {len(gradient_norms_compare)} parameters...")
         for name in gradient_norms_compare:
             gradient_norms_compare[name] /= len(unsafe_samples)
 
-        # Step 2: Calculate the average of cosine similarities for unsafe prompts with the reference
-        # EXACT variable names from original: row_coss, col_coss
-        row_coss = {}
-        col_coss = {}
+        # Step 2: Calculate cosine similarities using cached gradients
+        print("Computing cosine similarities for unsafe samples...")
+        for i, gradients in unsafe_gradients_cache.items():
+            row_cos, col_cos = self.compute_cosine_similarities(gradients, gradient_norms_compare)
 
-        for sample in unsafe_samples:
-            gradients = self._process_sample_for_gradient(sample, "Sure")
-            if gradients:
-                row_cos, col_cos = self.compute_cosine_similarities(gradients, gradient_norms_compare)
-
-                for name in row_cos:
-                    if name not in row_coss:
-                        row_coss[name] = row_cos[name].clone()
-                        col_coss[name] = col_cos[name].clone()
-                    else:
-                        row_coss[name] += row_cos[name]
-                        col_coss[name] += col_cos[name]
+            for name in row_cos:
+                if name not in row_coss:
+                    row_coss[name] = row_cos[name].clone()
+                    col_coss[name] = col_cos[name].clone()
+                else:
+                    row_coss[name] += row_cos[name]
+                    col_coss[name] += col_cos[name]
 
         # Average - EXACT from original
         for name in row_coss:
             row_coss[name] /= len(unsafe_samples)
             col_coss[name] /= len(unsafe_samples)
 
+        # Clear cache to free memory
+        del unsafe_gradients_cache
+
         # Step 3: Calculate the average of cosine similarities for safe prompts with the reference
         # EXACT variable names from original: safe_row_coss, safe_col_coss
         safe_row_coss = {}
         safe_col_coss = {}
 
-        for sample in safe_samples:
+        print("Computing cosine similarities for safe samples...")
+        for i, sample in enumerate(safe_samples):
+            print(f"Processing safe sample {i+1}/{len(safe_samples)}: {sample['txt'][:50]}...")
             gradients = self._process_sample_for_gradient(sample, "Sure")
             if gradients:
                 row_cos, col_cos = self.compute_cosine_similarities(gradients, gradient_norms_compare)
@@ -601,6 +613,8 @@ class GradSafeLLaVA:
                     else:
                         safe_row_coss[name] += row_cos[name]
                         safe_col_coss[name] += col_cos[name]
+
+                self._aggressive_cleanup()
 
         # Average safe cosine similarities correctly (fix the bug)
         for name in safe_row_coss:
