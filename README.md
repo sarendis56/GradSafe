@@ -24,17 +24,58 @@ Please download the dataset and save at the ./data
 
 Please download Llama-2 7b from https://huggingface.co/meta-llama/Llama-2-7b-chat-hf, and save at ./model
 
-## Demo
+## Multi-Modal GradSafe Evaluation (LLaVA)
 
-Evaluate the performance of GradSafe on two dataset:
+This repository has been extended to support multi-modal language models like LLaVA with vision-language capabilities.
 
-> python ./code/test_xstest.py
+### Prerequisites
 
-> python ./code/test_toxicchat.py
+1. **Environment Setup**:
+   - Ensure you have the `llava` conda environment activated:
+     ```bash
+     conda activate llava
+     ```
+
+2. **Model**:
+   - Download LLaVA model (e.g., `llava-v1.6-vicuna-7b`) and save it in the `./model` directory
+
+### Running Multi-Modal Evaluation
+
+#### Quick Test (200 samples from XSTest):
+```bash
+python run_gradsafe_evaluation.py --quick_test
+```
+
+#### Full Benchmark (1800 samples):
+```bash
+python run_gradsafe_evaluation.py [--model_path MODEL_PATH] [--use_training_data] [--output_file OUTPUT_FILE]
+```
+
+#### Command-line Options:
+- `--model_path`: Path to LLaVA model directory (default: `model/llava-v1.6-vicuna-7b`)
+- `--use_training_data`: Use training data to find critical parameters (default: use built-in examples)
+- `--output_file`: Output file for results (default: `gradsafe_llava_results.json`)
+- `--skip_env_check`: Skip conda environment check
+- `--quick_test`: Run quick test on 100+100 XSTest samples
+- `--disable_cache`: Disable caching of gradients and scores
+- `--cooling_interval`: Samples before cooling break (default: 10)
+- `--cooling_time`: Cooling break duration in seconds (default: 60)
+
+### Benchmark Datasets
+
+The multi-modal evaluation uses a comprehensive vision-language benchmark:
+
+**Training Set (2,000 examples, 1:1 ratio)**:
+- Benign (1,000): Alpaca (500) + MM-Vet (218) + OpenAssistant (282)
+- Malicious (1,000): AdvBench (300) + JailbreakV-28K (550) + DAN variants (150)
+
+**Test Set (1,800 examples, 1:1 ratio)**:
+- Safe (900): XSTest safe (250) + FigTxt safe (300) + VQAv2 (350)
+- Unsafe (900): XSTest unsafe (200) + FigTxt unsafe (350) + VAE (200) + JailbreakV-28K (150)
 
 ## Citation
 
-If you find this work useful for your research, please cite:
+If you find this work useful for your research, please cite the original paper (you don't need to cite this repository):
 ```
 @inproceedings{xie2024gradsafe,
   title={GradSafe: Detecting Jailbreak Prompts for LLMs via Safety-Critical Gradient Analysis},
@@ -44,5 +85,3 @@ If you find this work useful for your research, please cite:
   year={2024}
 }
 ```
-
-
