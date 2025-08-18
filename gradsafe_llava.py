@@ -247,15 +247,11 @@ class GradSafeLLaVA:
 
             conv = conv_templates[conv_mode].copy()
 
-            # For now, treat all samples as text-only to avoid image processing issues
-            # TODO: Re-enable image processing later
-            qs = sample['txt']
-
-            # Disabled image processing for now
-            # if sample.get('img') is not None:
-            #     qs = self._adjust_query_for_images(sample['txt'])
-            # else:
-            #     qs = sample['txt']
+            # Enable proper multimodal processing for vision-language GradSafe
+            if sample.get('img') is not None:
+                qs = self._adjust_query_for_images(sample['txt'])
+            else:
+                qs = sample['txt']
 
             conv.append_message(conv.roles[0], qs)
             conv.append_message(conv.roles[1], target_response)
@@ -290,32 +286,53 @@ class GradSafeLLaVA:
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
 
+    def _as_2d(self, t):
+        """
+        Convert tensor to 2D matrix for cosine similarity computation
+        Treats first dimension as "rows", flattens remaining dims to "cols"
+        """
+        if t.ndim == 1:
+            return t.unsqueeze(1)  # (R, 1)
+        elif t.ndim == 2:
+            return t
+        else:
+            R = t.shape[0]
+            C = int(torch.prod(torch.tensor(t.shape[1:])).item())
+            return t.reshape(R, C)
+
     def compute_cosine_similarities(self, gradients, reference_gradients):
         """
-        Compute row-wise and column-wise cosine similarities exactly as per original GradSafe code
-        Only processes safety-critical parameters (MLP and self-attention)
+        Compute row-wise and column-wise cosine similarities as per GradSafe paper
+        Process ALL learnable parameters with proper handling of arbitrary tensor shapes
         """
         row_cosines = {}
         col_cosines = {}
 
         for name, param in gradients.items():
-            # EXACT condition from original code: ("mlp" in name or "self" in name)
-            if param is not None and ("mlp" in name or "self" in name):
-                if name in reference_gradients:
-                    grad_norm = param.to(reference_gradients[name].device)
-                    ref_grad = reference_gradients[name]
+            # Process ALL parameters with gradients and 1D+ shape (as per paper)
+            if param is not None and name in reference_gradients and len(param.shape) >= 1:
+                grad_norm = param.to(reference_gradients[name].device)
+                ref_grad = reference_gradients[name]
 
-                    try:
-                        # EXACT computation from original code
-                        row_cos = torch.nan_to_num(F.cosine_similarity(grad_norm, ref_grad, dim=1))
-                        col_cos = torch.nan_to_num(F.cosine_similarity(grad_norm, ref_grad, dim=0))
+                try:
+                    # Convert to 2D matrices and cast to fp32 for numerical stability
+                    g = self._as_2d(grad_norm.to(torch.float32))
+                    r = self._as_2d(ref_grad.to(torch.float32))
 
-                        row_cosines[name] = row_cos
-                        col_cosines[name] = col_cos
+                    # Row-wise cosine similarity: (R, C) -> cosine across dim=1
+                    row_cos = torch.nan_to_num(F.cosine_similarity(g, r, dim=1))
 
-                    except Exception as e:
-                        print(f"Error computing cosine similarity for {name}: {e}")
-                        continue
+                    # Column-wise cosine similarity: compute on transposed (C, R) -> cosine across dim=1
+                    g_T = g.transpose(0, 1).contiguous()
+                    r_T = r.transpose(0, 1).contiguous()
+                    col_cos = torch.nan_to_num(F.cosine_similarity(g_T, r_T, dim=1))
+
+                    row_cosines[name] = row_cos
+                    col_cosines[name] = col_cos
+
+                except Exception as e:
+                    print(f"Error computing cosine similarity for {name} (shape {param.shape}): {e}")
+                    continue
 
         return row_cosines, col_cosines
 
@@ -363,13 +380,11 @@ class GradSafeLLaVA:
                 print(f"Prompt: {prompt[:200]}...")
                 return {}
 
-            # Process image if present - but skip for now to avoid issues
+            # Process image if present - enable multimodal processing
             images = None
             image_sizes = None
 
-            # For now, skip image processing to avoid the image_sizes issue
-            # TODO: Fix image processing later
-            if False and sample.get('img') is not None:  # Disabled for now
+            if sample.get('img') is not None:
                 try:
                     image = self._load_image(sample['img'])
                     if image is not None:
@@ -384,32 +399,44 @@ class GradSafeLLaVA:
                     images = None
                     image_sizes = None
 
-            # Find target tokens (response part) - simplified masking
+            # Proper loss masking: target only assistant response "Sure"
             try:
                 if input_ids is None:
                     print("Error: input_ids is None before masking")
                     return {}
 
-                target_ids = input_ids.clone()
+                # Create labels that mask everything except assistant response
+                labels = torch.full_like(input_ids, -100)
 
-                # Simple masking: mask first 80% of tokens, compute loss on last 20%
-                seq_len = input_ids.shape[1]
-                if seq_len == 0:
-                    print("Error: sequence length is 0")
-                    return {}
+                # Robustly find assistant response "Sure" tokens
+                assistant_tokens = self.tokenizer(" Sure", add_special_tokens=False).input_ids
+                ids = input_ids[0].tolist()
+                pat = assistant_tokens
 
-                mask_len = int(seq_len * 0.8)
-                target_ids[:, :mask_len] = -100
+                # Find the last occurrence of "Sure" pattern in the sequence
+                start = -1
+                for i in range(len(ids) - len(pat), -1, -1):
+                    if ids[i:i+len(pat)] == pat:
+                        start = i
+                        break
+
+                if start != -1:
+                    # Found "Sure" - mask exactly that span
+                    labels[0, start:start+len(pat)] = torch.tensor(pat, device=input_ids.device)
+                else:
+                    # Conservative fallback: mask only the last len(pat) tokens
+                    # This avoids label leakage into user segment
+                    labels[0, -len(pat):] = input_ids[0, -len(pat):]
 
             except Exception as e:
-                print(f"Error during masking: {e}")
+                print(f"Error during proper masking: {e}")
                 print(f"input_ids type: {type(input_ids)}")
                 print(f"input_ids shape: {input_ids.shape if input_ids is not None else 'None'}")
                 return {}
 
-            # Setup optimizer
-            optimizer = torch.optim.SGD(self.model.parameters(), lr=0.01)
-            optimizer.zero_grad()
+            # Set model to training mode and enable gradients
+            self.model.train()
+            self.model.requires_grad_(True)
 
             # Forward pass with gradient checkpointing if available
             if hasattr(self.model, 'gradient_checkpointing_enable'):
@@ -420,14 +447,14 @@ class GradSafeLLaVA:
                 if input_ids is None:
                     print("Error: input_ids is None before forward pass")
                     return {}
-                if target_ids is None:
-                    print("Error: target_ids is None before forward pass")
+                if labels is None:
+                    print("Error: labels is None before forward pass")
                     return {}
 
                 # Prepare model inputs
                 model_inputs = {
                     'input_ids': input_ids,
-                    'labels': target_ids
+                    'labels': labels
                 }
 
                 # Add image inputs if present
@@ -454,7 +481,7 @@ class GradSafeLLaVA:
             except Exception as e:
                 print(f"Error during forward/backward pass: {e}")
                 print(f"input_ids shape: {input_ids.shape if input_ids is not None else 'None'}")
-                print(f"target_ids shape: {target_ids.shape if target_ids is not None else 'None'}")
+                print(f"labels shape: {labels.shape if labels is not None else 'None'}")
                 print(f"images: {images is not None}")
                 import traceback
                 traceback.print_exc()
@@ -469,10 +496,10 @@ class GradSafeLLaVA:
                     gradients[name] = param.grad.clone().cpu()
 
             # Clear gradients immediately after collection
-            optimizer.zero_grad()
+            self.model.zero_grad()
 
             # Clean up intermediate tensors
-            del outputs, loss, input_ids, target_ids
+            del outputs, loss, input_ids, labels
             if images is not None:
                 del images
 
@@ -575,10 +602,10 @@ class GradSafeLLaVA:
                         safe_row_coss[name] += row_cos[name]
                         safe_col_coss[name] += col_cos[name]
 
-        # Average - EXACT from original (note: bug in original uses len(unsafe_set) instead of len(safe_set))
+        # Average safe cosine similarities correctly (fix the bug)
         for name in safe_row_coss:
-            safe_row_coss[name] /= len(unsafe_samples)  # Keep original bug for exact replication
-            safe_col_coss[name] /= len(unsafe_samples)  # Keep original bug for exact replication
+            safe_row_coss[name] /= len(safe_samples)
+            safe_col_coss[name] /= len(safe_samples)
 
         # Step 4: Calculate the cosine similarity gaps for unsafe and safe prompts
         # EXACT variable names from original: minus_row_cos, minus_col_cos
@@ -681,6 +708,89 @@ class GradSafeLLaVA:
 
         return safety_score
 
+    def extract_cosine_features(self, sample, gradient_norms_compare, minus_row, minus_col):
+        """
+        Extract cosine similarity features for GradSafe-Adapt
+        Returns feature vector for logistic regression training
+        """
+        try:
+            # Compute gradients for the sample
+            gradients = self._process_sample_for_gradient(sample, "Sure", use_cache=False)
+            if not gradients:
+                return []
+
+            # Compute cosine similarities with reference gradients
+            row_cos, col_cos = self.compute_cosine_similarities(gradients, gradient_norms_compare)
+
+            # Extract features from critical positions only (same as safety score computation)
+            features = []
+
+            # Process row-wise critical parameters
+            for name in minus_row:
+                if name in row_cos:
+                    ref_row = minus_row[name]
+                    current_row_cos = row_cos[name]
+                    # Only include similarities for critical positions (gap > 1.0)
+                    critical_sims = current_row_cos[ref_row > 1.0]
+                    features.extend(critical_sims.cpu().tolist())
+
+            # Process column-wise critical parameters
+            for name in minus_col:
+                if name in col_cos:
+                    ref_col = minus_col[name]
+                    current_col_cos = col_cos[name]
+                    # Only include similarities for critical positions (gap > 1.0)
+                    critical_sims = current_col_cos[ref_col > 1.0]
+                    features.extend(critical_sims.cpu().tolist())
+
+            return features
+
+        except Exception as e:
+            print(f"Error extracting cosine features: {e}")
+            return []
+
+    def train_gradsafe_adapt(self, training_samples, gradient_norms_compare, minus_row, minus_col):
+        """
+        Train GradSafe-Adapt logistic regression classifier
+        """
+        from sklearn.linear_model import LogisticRegression
+        import numpy as np
+
+        print("Training GradSafe-Adapt classifier...")
+
+        # Extract features and labels from training samples
+        X = []
+        y = []
+
+        for sample in tqdm(training_samples, desc="Extracting features"):
+            features = self.extract_cosine_features(sample, gradient_norms_compare, minus_row, minus_col)
+            if features:  # Only include samples with valid features
+                X.append(features)
+                y.append(sample.get('toxicity', 0))
+
+        if not X:
+            print("No valid features extracted for training")
+            return None
+
+        # Pad features to same length (handle variable feature dimensions)
+        max_len = max(len(x) for x in X)
+        X_padded = []
+        for x in X:
+            padded = x + [0.0] * (max_len - len(x))  # Pad with zeros
+            X_padded.append(padded)
+
+        X = np.array(X_padded)
+        y = np.array(y)
+
+        print(f"Training on {len(X)} samples with {X.shape[1]} features each")
+
+        # Train logistic regression
+        clf = LogisticRegression(random_state=42, max_iter=1000)
+        clf.fit(X, y)
+
+        print(f"GradSafe-Adapt classifier trained. Feature dimension: {X.shape[1]}")
+        return clf
+
     def evaluate_samples(self, samples, gradient_norms_compare, minus_row, minus_col,
                         threshold=0.25, batch_size=10, cooling_interval=20, cooling_time=20, use_cache=True):
         """
@@ -740,7 +850,7 @@ class GradSafeLLaVA:
                 score = self.compute_safety_score(sample, gradient_norms_compare, minus_row, minus_col, use_cache=use_cache)
                 safety_scores.append(score)
 
-                # Make prediction based on threshold
+                # Make prediction based on threshold (GradSafe paper uses 0.25)
                 prediction = 1 if score >= threshold else 0
                 predictions.append(prediction)
 

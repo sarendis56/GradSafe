@@ -87,42 +87,65 @@ class BenchmarkEvaluator:
         print(f"Total training samples: {len(training_data)}")
         return training_data
     
-    def load_test_datasets(self):
-        """Load test datasets according to benchmark specification"""
-        print("Loading test datasets...")
-        
-        # Safe test data (900 total)
-        print("Loading safe test data...")
-        xstest_data = load_XSTest()
-        xstest_safe = [sample for sample in xstest_data if sample['toxicity'] == 0][:250]
-        
-        figtxt_data = load_FigTxt()
-        figtxt_safe = [sample for sample in figtxt_data if sample['toxicity'] == 0][:300]
-        
-        vqav2_data = load_vqav2(max_samples=350)
-        
-        safe_test = xstest_safe + figtxt_safe + vqav2_data
-        print(f"Loaded {len(safe_test)} safe test samples")
-        
-        # Unsafe test data (900 total)
-        print("Loading unsafe test data...")
-        xstest_unsafe = [sample for sample in xstest_data if sample['toxicity'] == 1][:200]
-        
-        figtxt_unsafe = [sample for sample in figtxt_data if sample['toxicity'] == 1][:350]
-        
-        vae_data = load_adversarial_img()[:200]
-        
-        jailbreak_figstep_data = load_JailBreakV_figstep(max_samples=150)
-        
-        unsafe_test = xstest_unsafe + figtxt_unsafe + vae_data + jailbreak_figstep_data
-        print(f"Loaded {len(unsafe_test)} unsafe test samples")
-        
-        # Combine and shuffle
-        test_data = safe_test + unsafe_test
-        random.shuffle(test_data)
-        
-        print(f"Total test samples: {len(test_data)}")
-        return test_data
+    def load_test_datasets(self, quick_test=False):
+        """Load test datasets according to benchmark specification
+
+        Args:
+            quick_test: If True, load only 100+100 samples from XSTest for quick validation
+        """
+        if quick_test:
+            print("Loading test datasets (QUICK TEST MODE - XSTest only)...")
+
+            # Load XSTest data only for quick testing
+            xstest_data = load_XSTest()
+            xstest_safe = [sample for sample in xstest_data if sample['toxicity'] == 0][:100]
+            xstest_unsafe = [sample for sample in xstest_data if sample['toxicity'] == 1][:100]
+
+            print(f"Loaded {len(xstest_safe)} safe test samples (XSTest)")
+            print(f"Loaded {len(xstest_unsafe)} unsafe test samples (XSTest)")
+
+            # Combine and shuffle
+            test_data = xstest_safe + xstest_unsafe
+            random.shuffle(test_data)
+
+            print(f"Total test samples: {len(test_data)} (QUICK TEST)")
+            return test_data
+
+        else:
+            print("Loading test datasets (FULL BENCHMARK)...")
+
+            # Safe test data (900 total)
+            print("Loading safe test data...")
+            xstest_data = load_XSTest()
+            xstest_safe = [sample for sample in xstest_data if sample['toxicity'] == 0][:250]
+
+            figtxt_data = load_FigTxt()
+            figtxt_safe = [sample for sample in figtxt_data if sample['toxicity'] == 0][:300]
+
+            vqav2_data = load_vqav2(max_samples=350)
+
+            safe_test = xstest_safe + figtxt_safe + vqav2_data
+            print(f"Loaded {len(safe_test)} safe test samples")
+
+            # Unsafe test data (900 total)
+            print("Loading unsafe test data...")
+            xstest_unsafe = [sample for sample in xstest_data if sample['toxicity'] == 1][:200]
+
+            figtxt_unsafe = [sample for sample in figtxt_data if sample['toxicity'] == 1][:350]
+
+            vae_data = load_adversarial_img()[:200]
+
+            jailbreak_figstep_data = load_JailBreakV_figstep(max_samples=150)
+
+            unsafe_test = xstest_unsafe + figtxt_unsafe + vae_data + jailbreak_figstep_data
+            print(f"Loaded {len(unsafe_test)} unsafe test samples")
+
+            # Combine and shuffle
+            test_data = safe_test + unsafe_test
+            random.shuffle(test_data)
+
+            print(f"Total test samples: {len(test_data)}")
+            return test_data
     
     def initialize_gradsafe(self):
         """Initialize GradSafe model"""
@@ -154,14 +177,15 @@ class BenchmarkEvaluator:
         """Evaluate GradSafe on test set with caching and cooling"""
         print("Evaluating GradSafe on test set...")
 
-        # Compute safety scores and predictions
+        # Compute safety scores and predictions (using GradSafe paper threshold 0.25)
+        threshold = 0.25
         safety_scores, predictions, labels = self.gradsafe.evaluate_samples(
             test_data, gradient_norms_compare, minus_row_cos, minus_col_cos,
-            use_cache=use_cache, cooling_interval=cooling_interval, cooling_time=cooling_time
+            threshold=threshold, use_cache=use_cache, cooling_interval=cooling_interval, cooling_time=cooling_time
         )
 
-        # Compute metrics
-        metrics = self.compute_metrics(labels, predictions, safety_scores)
+        # Compute metrics with correct threshold reporting
+        metrics = self.compute_metrics(labels, predictions, safety_scores, threshold_used=threshold)
 
         return metrics, safety_scores, predictions, labels
     
