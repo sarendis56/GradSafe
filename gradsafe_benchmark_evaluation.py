@@ -149,18 +149,20 @@ class BenchmarkEvaluator:
 
         return self.gradsafe.find_critical_parameters(unsafe_samples, safe_samples)
     
-    def evaluate_on_test_set(self, test_data, reference_gradients, row_cosine_gaps, col_cosine_gaps):
-        """Evaluate GradSafe on test set"""
+    def evaluate_on_test_set(self, test_data, reference_gradients, row_cosine_gaps, col_cosine_gaps,
+                           use_cache=True, cooling_interval=10, cooling_time=60):
+        """Evaluate GradSafe on test set with caching and cooling"""
         print("Evaluating GradSafe on test set...")
-        
+
         # Compute safety scores and predictions
         safety_scores, predictions, labels = self.gradsafe.evaluate_samples(
-            test_data, reference_gradients, row_cosine_gaps, col_cosine_gaps
+            test_data, reference_gradients, row_cosine_gaps, col_cosine_gaps,
+            use_cache=use_cache, cooling_interval=cooling_interval, cooling_time=cooling_time
         )
-        
+
         # Compute metrics
         metrics = self.compute_metrics(labels, predictions, safety_scores)
-        
+
         return metrics, safety_scores, predictions, labels
     
     def find_optimal_threshold(self, true_labels, scores):

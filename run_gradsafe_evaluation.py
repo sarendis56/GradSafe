@@ -63,6 +63,12 @@ def main():
                         help='Skip conda environment check')
     parser.add_argument('--optimize_threshold', action='store_true',
                         help='Find and use optimal threshold instead of default 0.25')
+    parser.add_argument('--disable_cache', action='store_true',
+                        help='Disable caching of gradients and scores')
+    parser.add_argument('--cooling_interval', type=int, default=10,
+                        help='Number of samples to process before cooling break (default: 10)')
+    parser.add_argument('--cooling_time', type=int, default=60,
+                        help='Cooling break duration in seconds (default: 60)')
     
     args = parser.parse_args()
     
@@ -73,6 +79,8 @@ def main():
     print(f"Model path: {args.model_path}")
     print(f"Use training data: {args.use_training_data}")
     print(f"Output file: {args.output_file}")
+    print(f"Caching: {'disabled' if args.disable_cache else 'enabled'}")
+    print(f"Cooling: {args.cooling_time}s break every {args.cooling_interval} samples")
     print("="*80)
     
     # Check environment
@@ -136,7 +144,10 @@ def main():
         print("\nStep 4: Evaluating on test set...")
         start_time = time.time()
         metrics, safety_scores, predictions, labels = evaluator.evaluate_on_test_set(
-            test_data, reference_gradients, row_cosine_gaps, col_cosine_gaps
+            test_data, reference_gradients, row_cosine_gaps, col_cosine_gaps,
+            use_cache=not args.disable_cache,
+            cooling_interval=args.cooling_interval,
+            cooling_time=args.cooling_time
         )
         eval_time = time.time() - start_time
         print(f"Test set evaluation completed in {eval_time:.2f} seconds")

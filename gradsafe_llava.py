@@ -13,6 +13,8 @@ from PIL import Image
 from io import BytesIO
 import requests
 import re
+import hashlib
+import time
 
 # Suppress warnings
 warnings.filterwarnings("ignore", message=".*copying from a non-meta parameter in the checkpoint to a meta parameter.*")
@@ -35,9 +37,9 @@ from llava.mm_utils import (
 )
 
 class GradSafeLLaVA:
-    """GradSafe implementation for LLaVA vision-language models"""
-    
-    def __init__(self, model_path, device='cuda'):
+    """GradSafe implementation for LLaVA vision-language models with caching"""
+
+    def __init__(self, model_path, device='cuda', cache_dir='gradsafe_cache'):
         self.model_path = model_path
         self.device = device
         self.model = None
@@ -46,12 +48,66 @@ class GradSafeLLaVA:
         self.context_len = None
         self.model_name = None
 
+        # Setup caching
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+
         # Check available GPUs
         self.num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
         print(f"Available GPUs: {self.num_gpus}")
 
         # Load model
         self._load_model()
+
+    def _get_sample_hash(self, sample, target_response="Sure"):
+        """Generate a unique hash for a sample to use as cache key"""
+        # Create a string representation of the sample for hashing
+        sample_str = f"{sample.get('txt', '')}__{target_response}"
+        if sample.get('img') is not None:
+            sample_str += f"__{sample['img']}"
+
+        # Generate hash
+        return hashlib.md5(sample_str.encode()).hexdigest()
+
+    def _save_gradients_to_cache(self, sample_hash, gradients):
+        """Save gradients to cache file"""
+        cache_file = os.path.join(self.cache_dir, f"gradients_{sample_hash}.pkl")
+        try:
+            with open(cache_file, 'wb') as f:
+                pickle.dump(gradients, f)
+        except Exception as e:
+            print(f"Warning: Failed to save gradients to cache: {e}")
+
+    def _load_gradients_from_cache(self, sample_hash):
+        """Load gradients from cache file"""
+        cache_file = os.path.join(self.cache_dir, f"gradients_{sample_hash}.pkl")
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'rb') as f:
+                    return pickle.load(f)
+            except Exception as e:
+                print(f"Warning: Failed to load gradients from cache: {e}")
+        return None
+
+    def _save_safety_score_to_cache(self, sample_hash, score):
+        """Save safety score to cache file"""
+        cache_file = os.path.join(self.cache_dir, f"score_{sample_hash}.pkl")
+        try:
+            with open(cache_file, 'wb') as f:
+                pickle.dump(score, f)
+        except Exception as e:
+            print(f"Warning: Failed to save score to cache: {e}")
+
+    def _load_safety_score_from_cache(self, sample_hash):
+        """Load safety score from cache file"""
+        cache_file = os.path.join(self.cache_dir, f"score_{sample_hash}.pkl")
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'rb') as f:
+                    return pickle.load(f)
+            except Exception as e:
+                print(f"Warning: Failed to load score from cache: {e}")
+        return None
         
     def _load_model(self):
         """Load LLaVA model and components with multi-GPU support"""
@@ -213,8 +269,15 @@ class GradSafeLLaVA:
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
 
-    def _process_sample_for_gradient(self, sample, target_response="Sure"):
-        """Process a sample and compute gradients with memory management"""
+    def _process_sample_for_gradient(self, sample, target_response="Sure", use_cache=True):
+        """Process a sample and compute gradients with memory management and caching"""
+        # Check cache first
+        if use_cache:
+            sample_hash = self._get_sample_hash(sample, target_response)
+            cached_gradients = self._load_gradients_from_cache(sample_hash)
+            if cached_gradients is not None:
+                return cached_gradients
+
         # Clear gradients first
         if hasattr(self.model, 'zero_grad'):
             self.model.zero_grad()
@@ -361,6 +424,10 @@ class GradSafeLLaVA:
             del outputs, loss, input_ids, target_ids
             if images is not None:
                 del images
+
+            # Save to cache if enabled
+            if use_cache and gradients:
+                self._save_gradients_to_cache(sample_hash, gradients)
 
             return gradients
 
@@ -539,20 +606,28 @@ class GradSafeLLaVA:
 
         return reference_gradients, row_cosine_gaps, col_cosine_gaps
 
-    def compute_safety_score(self, sample, reference_gradients, row_cosine_gaps, col_cosine_gaps):
+    def compute_safety_score(self, sample, reference_gradients, row_cosine_gaps, col_cosine_gaps, use_cache=True):
         """
-        Compute safety score for a single sample
+        Compute safety score for a single sample with caching
 
         Args:
             sample: Sample to evaluate (dict with 'txt' and 'img' keys)
             reference_gradients: Reference gradients from unsafe samples
             row_cosine_gaps: Row-wise cosine similarity gaps
             col_cosine_gaps: Column-wise cosine similarity gaps
+            use_cache: Whether to use caching for scores
 
         Returns:
             float: Safety score (higher = more likely unsafe)
         """
         try:
+            # Check cache first
+            if use_cache:
+                sample_hash = self._get_sample_hash(sample, "Sure")
+                cached_score = self._load_safety_score_from_cache(sample_hash)
+                if cached_score is not None:
+                    return cached_score
+
             # Validate inputs
             if sample is None:
                 print("Warning: Sample is None in compute_safety_score")
@@ -563,7 +638,7 @@ class GradSafeLLaVA:
                 return 0.0
 
             # Compute gradients for the sample
-            gradients = self._process_sample_for_gradient(sample, "Sure")
+            gradients = self._process_sample_for_gradient(sample, "Sure", use_cache=use_cache)
 
             if not gradients:
                 return 0.0
@@ -612,14 +687,19 @@ class GradSafeLLaVA:
         else:
             safety_score = 0.0
 
+        # Save to cache if enabled
+        if use_cache:
+            self._save_safety_score_to_cache(sample_hash, safety_score)
+
         # Cleanup after computation
         self._aggressive_cleanup()
 
         return safety_score
 
-    def evaluate_samples(self, samples, reference_gradients, row_cosine_gaps, col_cosine_gaps, threshold=0.25, batch_size=10):
+    def evaluate_samples(self, samples, reference_gradients, row_cosine_gaps, col_cosine_gaps,
+                        threshold=0.25, batch_size=10, cooling_interval=10, cooling_time=60, use_cache=True):
         """
-        Evaluate multiple samples and return predictions with batch processing
+        Evaluate multiple samples and return predictions with batch processing, caching, and cooling
 
         Args:
             samples: List of samples to evaluate
@@ -628,6 +708,9 @@ class GradSafeLLaVA:
             col_cosine_gaps: Column-wise cosine similarity gaps
             threshold: Classification threshold
             batch_size: Number of samples to process before cleanup
+            cooling_interval: Number of samples to process before cooling break
+            cooling_time: Cooling break duration in seconds
+            use_cache: Whether to use caching
 
         Returns:
             tuple: (safety_scores, predictions, labels)
@@ -637,6 +720,17 @@ class GradSafeLLaVA:
         labels = []
 
         print(f"Evaluating {len(samples)} samples in batches of {batch_size}...")
+        print(f"Caching: {'enabled' if use_cache else 'disabled'}")
+        print(f"Cooling: {cooling_time}s break every {cooling_interval} samples")
+
+        # Check how many samples are already cached
+        cached_count = 0
+        if use_cache:
+            for sample in samples:
+                sample_hash = self._get_sample_hash(sample, "Sure")
+                if self._load_safety_score_from_cache(sample_hash) is not None:
+                    cached_count += 1
+            print(f"Found {cached_count}/{len(samples)} samples already cached")
 
         for i, sample in enumerate(tqdm(samples, desc="Computing safety scores")):
             try:
@@ -649,7 +743,7 @@ class GradSafeLLaVA:
                     continue
 
                 # Compute safety score
-                score = self.compute_safety_score(sample, reference_gradients, row_cosine_gaps, col_cosine_gaps)
+                score = self.compute_safety_score(sample, reference_gradients, row_cosine_gaps, col_cosine_gaps, use_cache=use_cache)
                 safety_scores.append(score)
 
                 # Make prediction based on threshold
@@ -672,6 +766,12 @@ class GradSafeLLaVA:
                 if (i + 1) % batch_size == 0:
                     self._aggressive_cleanup()
                     print(f"Processed {i + 1}/{len(samples)} samples")
+
+                # Cooling break to prevent server overheating
+                if (i + 1) % cooling_interval == 0 and (i + 1) < len(samples):
+                    print(f"🌡️  Cooling break: pausing for {cooling_time} seconds to prevent overheating...")
+                    time.sleep(cooling_time)
+                    print("Resuming evaluation...")
 
             except Exception as e:
                 print(f"Error processing sample {i}: {e}")
