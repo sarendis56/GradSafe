@@ -136,15 +136,15 @@ def main():
         # Find critical parameters
         print("\nStep 3: Finding safety-critical parameters...")
         start_time = time.time()
-        reference_gradients, row_cosine_gaps, col_cosine_gaps = evaluator.find_critical_parameters(training_data)
+        gradient_norms_compare, minus_row_cos, minus_col_cos = evaluator.find_critical_parameters(training_data)
         param_time = time.time() - start_time
         print(f"Critical parameter identification completed in {param_time:.2f} seconds")
-        
+
         # Evaluate on test set
         print("\nStep 4: Evaluating on test set...")
         start_time = time.time()
         metrics, safety_scores, predictions, labels = evaluator.evaluate_on_test_set(
-            test_data, reference_gradients, row_cosine_gaps, col_cosine_gaps,
+            test_data, gradient_norms_compare, minus_row_cos, minus_col_cos,
             use_cache=not args.disable_cache,
             cooling_interval=args.cooling_interval,
             cooling_time=args.cooling_time
