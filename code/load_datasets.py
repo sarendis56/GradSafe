@@ -10,16 +10,26 @@ import warnings
 # Suppress the specific PyTorch warning about meta parameters
 warnings.filterwarnings("ignore", message=".*copying from a non-meta parameter in the checkpoint to a meta parameter.*")
 
+# Global seed for reproducible dataset sampling
+DATASET_RANDOM_SEED = 42
+
 # Set random seed for reproducible dataset sampling
 # This ensures consistent results across runs when using random.sample()
-random.seed(42)
-np.random.seed(42)
+random.seed(DATASET_RANDOM_SEED)
+np.random.seed(DATASET_RANDOM_SEED)
 
 def set_dataset_random_seed(seed=42):
     """Set random seed for reproducible dataset sampling"""
+    global DATASET_RANDOM_SEED
+    DATASET_RANDOM_SEED = seed
     random.seed(seed)
     np.random.seed(seed)
     print(f"Dataset random seed set to {seed}")
+
+def ensure_deterministic_sampling():
+    """Ensure deterministic sampling by resetting seed before random operations"""
+    random.seed(DATASET_RANDOM_SEED)
+    np.random.seed(DATASET_RANDOM_SEED)
 
 def load_XSTest(file_path = 'data/XSTest/data/gpt4-00000-of-00001.parquet'):
     if file_path.endswith('.parquet'):
@@ -73,7 +83,14 @@ def load_mm_vet(json_path = "data/MM-Vet/mm-vet.json"):
                 if isinstance(item, dict):
                     # Extract question text and image path
                     question = item.get('question', item.get('text', ''))
-                    image_path = item.get('image', item.get('image_path', None))
+
+                    # Handle MM-Vet specific image naming convention
+                    image_name = item.get('imagename', item.get('image', item.get('image_path', None)))
+                    if image_name and not image_name.startswith(('http://', 'https://', '/')):
+                        # Construct full path to MM-Vet images directory
+                        image_path = f"data/MM-Vet/images/{image_name}"
+                    else:
+                        image_path = image_name
 
                     sample = {
                         "txt": question,
@@ -96,9 +113,17 @@ def load_mm_vet(json_path = "data/MM-Vet/mm-vet.json"):
             for i, item in enumerate(raw_data):
                 if isinstance(item, dict):
                     # Ensure proper format
+                    # Handle MM-Vet specific image naming convention
+                    image_name = item.get('imagename', item.get('image', item.get('image_path', item.get('img', None))))
+                    if image_name and not image_name.startswith(('http://', 'https://', '/')):
+                        # Construct full path to MM-Vet images directory
+                        image_path = f"data/MM-Vet/images/{image_name}"
+                    else:
+                        image_path = image_name
+
                     sample = {
                         "txt": item.get('question', item.get('text', item.get('txt', ''))),
-                        "img": item.get('image', item.get('image_path', item.get('img', None))),
+                        "img": image_path,
                         "toxicity": item.get('toxicity', 0),
                         "question_id": item.get('question_id', f"mmvet_{i}")
                     }
@@ -276,8 +301,10 @@ def load_JailBreakV_query_related(image_styles=None, max_samples=None):
     Load JailBreakV-28K dataset using query_related images
 
     Args:
-        image_styles: List of styles to include ['SD', 'typo'] or None for all
+        image_styles: List of styles to include ['SD', 'typo'] or None for default (SD only)
         max_samples: Maximum number of samples to return
+
+    Note: Defaults to SD style only to prevent dataset leakage with typo style
     """
     return _load_JailBreakV_subset(attack_types=["query_related"],
                                    image_styles=image_styles, max_samples=max_samples)
@@ -328,10 +355,11 @@ def _load_JailBreakV_subset(attack_types=None, image_styles=None, max_samples=No
         attack_types = ["figstep", "llm_transfer_attack", "query_related"]
 
     # Define available styles for each attack type (based on filename prefixes)
+    # Note: query_related defaults to only "SD" to prevent dataset leakage with figstep testing
     available_styles = {
         "figstep": ["figstep"],  # figstep images have no prefix
-        "llm_transfer_attack": ["nature", "noise", "SD", "blank"],  # SD not SD_related
-        "query_related": ["SD", "typo"]  # Only SD and typo prefixes exist
+        "llm_transfer_attack": ["nature", "noise", "SD", "blank"],
+        "query_related": ["SD"]  # Default to SD only to prevent leakage with typo style
     }
 
     try:
@@ -414,6 +442,8 @@ def _load_JailBreakV_subset(attack_types=None, image_styles=None, max_samples=No
 
         # Apply sample limit if specified
         if max_samples is not None and len(unsafe_set) > max_samples:
+            # Ensure deterministic sampling by resetting seed
+            ensure_deterministic_sampling()
             unsafe_set = random.sample(unsafe_set, max_samples)
             print(f"Sampled {max_samples} from {len(collected_images)} available samples")
 
@@ -436,10 +466,11 @@ def list_JailBreakV_available_styles():
     base_path = "data/JailBreakV-28K"
 
     # Define available styles based on filename prefixes
+    # Note: This shows ALL available styles, but query_related defaults to SD only
     available_styles = {
         "figstep": ["figstep"],
         "llm_transfer_attack": ["nature", "noise", "SD", "blank"],
-        "query_related": ["SD", "typo"]
+        "query_related": ["SD", "typo"]  # All available, but default is SD only
     }
 
     print("JailBreakV-28K Available Attack Types and Image Styles:")
@@ -602,7 +633,7 @@ def load_advbench(max_samples=None):
 # AlpacaToxicQA removed - not used in current experiments
 
 def load_dan_prompts(max_samples=None):
-    """Load DAN (Do Anything Now) jailbreak prompts from TrustAIRLab/in-the-wild-jailbreak-prompts"""
+    """Load jailbreak prompts from TrustAIRLab/in-the-wild-jailbreak-prompts"""
     import json
 
     try:
@@ -670,34 +701,92 @@ def load_adversarial_img():
         return unsafe_set
 
 def load_vqav2(max_samples=None):
-    """Load VQAv2 dataset for multimodal benign samples"""
+    """Load VQAv2 dataset for multimodal benign samples from validation set"""
     import json
     import os
 
-    # Try both relative paths (from code directory and from HiddenDetect directory)
-    possible_paths = [
-        "data/VQAv2/vqav2_samples.json",
-        "../data/VQAv2/vqav2_samples.json"
+    # Define paths for VQAv2 dataset files
+    possible_base_paths = [
+        "data/VQAv2",
+        "../data/VQAv2"
     ]
 
-    for path in possible_paths:
-        try:
-            if os.path.exists(path):
-                with open(path, 'r', encoding='utf-8') as f:
-                    samples = json.load(f)
+    base_path = None
+    for path in possible_base_paths:
+        if os.path.exists(path):
+            base_path = path
+            break
 
-                total_available = len(samples)
-                if max_samples and max_samples < total_available:
-                    samples = samples[:max_samples]
-                    print(f"Successfully loaded {len(samples)} samples from VQAv2 (out of {total_available} available)")
-                else:
-                    print(f"Successfully loaded {len(samples)} samples from VQAv2 (all available)")
-                return samples
-        except Exception as e:
-            continue
+    if base_path is None:
+        print("VQAv2 dataset directory not found.")
+        return []
 
-    print("VQAv2 dataset not found.")
-    return []
+    questions_file = os.path.join(base_path, "v2_OpenEnded_mscoco_val2014_questions.json")
+    annotations_file = os.path.join(base_path, "v2_mscoco_val2014_annotations.json")
+    images_dir = os.path.join(base_path, "images", "val2014")
+
+    try:
+        # Load questions
+        with open(questions_file, 'r', encoding='utf-8') as f:
+            questions_data = json.load(f)
+
+        # Load annotations (answers)
+        with open(annotations_file, 'r', encoding='utf-8') as f:
+            annotations_data = json.load(f)
+
+        # Create mapping from question_id to annotation
+        annotations_map = {}
+        for annotation in annotations_data['annotations']:
+            annotations_map[annotation['question_id']] = annotation
+
+        # Build samples
+        samples = []
+        questions = questions_data['questions']
+
+        # Ensure deterministic sampling
+        ensure_deterministic_sampling()
+
+        # If max_samples is specified and less than total, sample randomly
+        if max_samples and max_samples < len(questions):
+            questions = random.sample(questions, max_samples)
+
+        for question_item in questions:
+            question_id = question_item['question_id']
+            image_id = question_item['image_id']
+            question_text = question_item['question']
+
+            # Construct image path
+            image_filename = f"COCO_val2014_{image_id:012d}.jpg"
+            image_path = os.path.join(images_dir, image_filename)
+
+            # Check if image exists
+            if not os.path.exists(image_path):
+                continue
+
+            # Get annotation if available
+            annotation = annotations_map.get(question_id, {})
+            answers = annotation.get('answers', [])
+
+            # Create sample
+            sample = {
+                "txt": question_text,
+                "img": image_path,
+                "toxicity": 0,  # VQAv2 is benign
+                "question_id": question_id,
+                "image_id": image_id,
+                "answers": [ans['answer'] for ans in answers] if answers else []
+            }
+            samples.append(sample)
+
+        print(f"Successfully loaded {len(samples)} samples from VQAv2 validation set")
+        return samples
+
+    except FileNotFoundError as e:
+        print(f"VQAv2 dataset files not found: {e}")
+        return []
+    except Exception as e:
+        print(f"Error loading VQAv2 dataset: {e}")
+        return []
 
 def load_dan_jailbreak_prompts(max_samples=None):
     """Alias for load_dan_prompts for backward compatibility"""
@@ -735,7 +824,3 @@ def load_openassistant(max_samples=None):
 
     print("OpenAssistant dataset not found. Please run download_openassistant.py first.")
     return []
-
-# UltraChat, WildJailbreak variants, JBB-Behaviors, and MMIU-Benchmark removed - not used in current experiments
-
-# MMMU removed - not used in current experiments
