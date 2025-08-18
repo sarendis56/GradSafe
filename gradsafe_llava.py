@@ -189,19 +189,10 @@ class GradSafeLLaVA:
         return conv_mode
     
     def _adjust_query_for_images(self, qs):
-        """Add image tokens to query if images are present"""
-        image_token_se = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
+        """Ensure the prompt contains the IMAGE placeholder so special tokenization inserts IMAGE_TOKEN_INDEX."""
         if IMAGE_PLACEHOLDER in qs:
-            if self.model.config.mm_use_im_start_end:
-                qs = re.sub(IMAGE_PLACEHOLDER, image_token_se, qs)
-            else:
-                qs = re.sub(IMAGE_PLACEHOLDER, DEFAULT_IMAGE_TOKEN, qs)
-        else:
-            if self.model.config.mm_use_im_start_end:
-                qs = image_token_se + "\n" + qs
-            else:
-                qs = DEFAULT_IMAGE_TOKEN + "\n" + qs
-        return qs
+            return qs
+        return IMAGE_PLACEHOLDER + "\n" + qs
     
     def _normalize_sample(self, sample):
         """Normalize sample format to ensure consistent structure"""
@@ -360,16 +351,20 @@ class GradSafeLLaVA:
                 print("Failed to construct prompt, skipping sample")
                 return {}
 
-            # Tokenize prompt - use primary GPU
-            primary_device = f"cuda:{0}" if torch.cuda.is_available() else "cpu"
+            # Tokenize prompt - keep on CPU so Accelerate can dispatch to the right devices
+            primary_device = "cpu"
 
             try:
-                tokenized = self.tokenizer(prompt, return_tensors="pt")
-                if tokenized is None or tokenized.input_ids is None:
-                    print("Error: Tokenizer returned None")
-                    return {}
-
-                input_ids = tokenized.input_ids.to(primary_device)
+                if sample.get('img') is not None:
+                    # Use special tokenizer that inserts IMAGE_TOKEN_INDEX
+                    ids_1d = tokenizer_image_token(prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt')
+                    input_ids = ids_1d.unsqueeze(0)  # add batch dim
+                else:
+                    tokenized = self.tokenizer(prompt, return_tensors="pt")
+                    if tokenized is None or tokenized.input_ids is None:
+                        print("Error: Tokenizer returned None")
+                        return {}
+                    input_ids = tokenized.input_ids
 
                 if input_ids is None or input_ids.shape[1] == 0:
                     print("Error: input_ids is None or empty")
@@ -384,13 +379,15 @@ class GradSafeLLaVA:
             images = None
             image_sizes = None
 
-            if sample.get('img') is not None:
+            has_image_in_sample = sample.get('img') is not None
+            if has_image_in_sample:
                 try:
                     image = self._load_image(sample['img'])
                     if image is not None:
                         images = process_images([image], self.image_processor, self.model.config)
                         if images is not None:
-                            images = images.to(primary_device, dtype=torch.float16)
+                            # keep on CPU; cast dtype only. Accelerate will move tensors to appropriate devices.
+                            images = images.half()
                             # Get image sizes for LLaVA
                             image_sizes = [image.size]  # PIL image size is (width, height)
                 except Exception as e:
@@ -452,6 +449,16 @@ class GradSafeLLaVA:
                 if labels is None:
                     print("Error: labels is None before forward pass")
                     return {}
+
+                # If we have an image but tokenizer didn't include IMAGE tokens, drop images to avoid cross-device concat
+                try:
+                    has_image_token = (input_ids == IMAGE_TOKEN_INDEX).any().item()
+                except Exception:
+                    has_image_token = False
+
+                if has_image_in_sample and not has_image_token:
+                    images = None
+                    image_sizes = None
 
                 # Prepare model inputs
                 model_inputs = {
