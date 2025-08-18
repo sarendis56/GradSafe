@@ -290,6 +290,62 @@ class GradSafeLLaVA:
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
 
+    def slice_gradients(self, gradients, max_slices_per_param=100):
+        """Memory-efficient slicing with sampling to avoid millions of slices"""
+        sliced_gradients = {}
+
+        for name, grad in gradients.items():
+            if len(grad.shape) >= 2:  # Only slice 2D+ tensors
+                # Sample slices instead of taking all to reduce memory
+                max_row_slices = min(max_slices_per_param // 2, grad.shape[0])
+                max_col_slices = min(max_slices_per_param // 2, grad.shape[1])
+
+                # Sample row indices
+                if grad.shape[0] > max_row_slices:
+                    row_indices = torch.randperm(grad.shape[0])[:max_row_slices]
+                else:
+                    row_indices = torch.arange(grad.shape[0])
+
+                # Sample column indices
+                if grad.shape[1] > max_col_slices:
+                    col_indices = torch.randperm(grad.shape[1])[:max_col_slices]
+                else:
+                    col_indices = torch.arange(grad.shape[1])
+
+                # Create row slices
+                for i in row_indices:
+                    slice_name = f"{name}_row_{i.item()}"
+                    sliced_gradients[slice_name] = grad[i, :].clone()
+
+                # Create column slices
+                for j in col_indices:
+                    slice_name = f"{name}_col_{j.item()}"
+                    sliced_gradients[slice_name] = grad[:, j].clone()
+            else:
+                # Keep 1D tensors as-is
+                sliced_gradients[name] = grad.clone()
+
+        return sliced_gradients
+
+    def identify_critical_slices(self, unsafe_cosines, safe_cosines, threshold=1.0):
+        """Identify safety-critical parameter slices based on cosine similarity gaps"""
+        critical_slices = {}
+
+        for slice_name in unsafe_cosines:
+            if slice_name in safe_cosines:
+                # Average cosine similarities for this slice
+                avg_unsafe = sum(unsafe_cosines[slice_name]) / len(unsafe_cosines[slice_name])
+                avg_safe = sum(safe_cosines[slice_name]) / len(safe_cosines[slice_name])
+
+                # Compute gap
+                gap = avg_unsafe - avg_safe
+
+                # Mark as critical if gap exceeds threshold
+                if gap > threshold:
+                    critical_slices[slice_name] = gap
+
+        return critical_slices
+
     def _process_sample_for_gradient(self, sample, target_response="Sure", use_cache=True):
         """Process a sample and compute gradients with memory management and caching"""
         # Check cache first
@@ -434,7 +490,8 @@ class GradSafeLLaVA:
             # Collect gradients immediately and move to CPU to save GPU memory
             gradients = {}
             for name, param in self.model.named_parameters():
-                if param.grad is not None and ("mlp" in name or "self_attn" in name):
+                # Include all parameters as per original GradSafe paper
+                if param.grad is not None:
                     # Clone gradient and move to CPU immediately
                     gradients[name] = param.grad.clone().cpu()
 
@@ -527,132 +584,79 @@ class GradSafeLLaVA:
             print("ERROR: No valid gradients computed from unsafe samples")
             return {}, {}, {}
 
-        print(f"Computing cosine similarities for {len(unsafe_samples)} unsafe samples...")
+        # Skip redundant full-gradient similarity computation
+        # We'll compute slice-level similarities directly
 
-        # Calculate cosine similarities for unsafe prompts with reference
-        unsafe_row_cos = {}
-        unsafe_col_cos = {}
-        valid_unsafe = 0
+        # Skip redundant full-gradient similarity computation for safe samples too
+        # We'll compute slice-level similarities directly
 
-        for i, sample in enumerate(tqdm(unsafe_samples, desc="Computing unsafe cosine similarities")):
-            print(f"[{i+1}/{len(unsafe_samples)}] Computing unsafe similarity: {sample['txt'][:50]}...")
+        print("Computing slice-level similarities and identifying critical slices...")
+
+        # Slice the reference gradients for proper GradSafe implementation
+        print("Slicing reference gradients...")
+        sliced_reference_gradients = self.slice_gradients(reference_gradients)
+        print(f"Created {len(sliced_reference_gradients)} parameter slices")
+
+        # Optimized approach: reuse already computed gradients from reference computation
+        print("Computing slice-level cosine similarities...")
+        unsafe_slice_cos = {}
+        safe_slice_cos = {}
+
+        # Process unsafe samples with sliced gradients (reuse gradients from reference computation)
+        print("Processing unsafe slice similarities...")
+        for i, sample in enumerate(unsafe_samples):
             gradients = self._process_sample_for_gradient(sample, "Sure")
-
             if gradients:
-                valid_unsafe += 1
-                print(f"  ✓ Computing similarities for {len(gradients)} parameters")
-                for name, grad in gradients.items():
-                    if name in reference_gradients:
-                        ref_grad = reference_gradients[name]
-
-                        # Ensure both gradients are on CPU for memory efficiency
-                        if grad.device != ref_grad.device:
-                            grad = grad.cpu()
-                            ref_grad = ref_grad.cpu()
-
-                        # Compute cosine similarities
+                sliced_gradients = self.slice_gradients(gradients)
+                for slice_name, slice_grad in sliced_gradients.items():
+                    if slice_name in sliced_reference_gradients:
+                        ref_slice = sliced_reference_gradients[slice_name]
                         try:
-                            row_cos = torch.nan_to_num(F.cosine_similarity(grad, ref_grad, dim=1))
-                            col_cos = torch.nan_to_num(F.cosine_similarity(grad, ref_grad, dim=0))
+                            cos_sim = F.cosine_similarity(slice_grad.unsqueeze(0), ref_slice.unsqueeze(0)).item()
 
-                            if name not in unsafe_row_cos:
-                                unsafe_row_cos[name] = row_cos
-                                unsafe_col_cos[name] = col_cos
-                            else:
-                                unsafe_row_cos[name] += row_cos
-                                unsafe_col_cos[name] += col_cos
+                            if slice_name not in unsafe_slice_cos:
+                                unsafe_slice_cos[slice_name] = []
+                            unsafe_slice_cos[slice_name].append(cos_sim)
                         except Exception as e:
-                            print(f"  ✗ Error computing cosine similarity for {name}: {e}")
+                            print(f"  ✗ Error computing cosine similarity for slice {slice_name}: {e}")
+                            continue
 
-                # Cleanup after each sample
-                self._aggressive_cleanup()
-            else:
-                print(f"  ✗ Failed to get gradients")
-
-        # Average unsafe cosine similarities
-        if valid_unsafe > 0:
-            for name in unsafe_row_cos:
-                unsafe_row_cos[name] /= valid_unsafe
-                unsafe_col_cos[name] /= valid_unsafe
-            print(f"✓ Successfully processed {valid_unsafe}/{len(unsafe_samples)} unsafe samples for similarities")
-        else:
-            print("ERROR: No valid similarities computed from unsafe samples")
-
-        print(f"Computing cosine similarities for {len(safe_samples)} safe samples...")
-
-        # Calculate cosine similarities for safe prompts with reference
-        safe_row_cos = {}
-        safe_col_cos = {}
-        valid_safe = 0
-
-        for i, sample in enumerate(tqdm(safe_samples, desc="Computing safe cosine similarities")):
-            print(f"[{i+1}/{len(safe_samples)}] Computing safe similarity: {sample['txt'][:50]}...")
+        # Process safe samples with sliced gradients
+        print("Processing safe slice similarities...")
+        for i, sample in enumerate(safe_samples):
             gradients = self._process_sample_for_gradient(sample, "Sure")
-
             if gradients:
-                valid_safe += 1
-                print(f"  ✓ Computing similarities for {len(gradients)} parameters")
-                for name, grad in gradients.items():
-                    if name in reference_gradients:
-                        ref_grad = reference_gradients[name]
-
-                        # Ensure both gradients are on CPU for memory efficiency
-                        if grad.device != ref_grad.device:
-                            grad = grad.cpu()
-                            ref_grad = ref_grad.cpu()
-
-                        # Compute cosine similarities
+                sliced_gradients = self.slice_gradients(gradients)
+                for slice_name, slice_grad in sliced_gradients.items():
+                    if slice_name in sliced_reference_gradients:
+                        ref_slice = sliced_reference_gradients[slice_name]
                         try:
-                            row_cos = torch.nan_to_num(F.cosine_similarity(grad, ref_grad, dim=1))
-                            col_cos = torch.nan_to_num(F.cosine_similarity(grad, ref_grad, dim=0))
+                            cos_sim = F.cosine_similarity(slice_grad.unsqueeze(0), ref_slice.unsqueeze(0)).item()
 
-                            if name not in safe_row_cos:
-                                safe_row_cos[name] = row_cos
-                                safe_col_cos[name] = col_cos
-                            else:
-                                safe_row_cos[name] += row_cos
-                                safe_col_cos[name] += col_cos
+                            if slice_name not in safe_slice_cos:
+                                safe_slice_cos[slice_name] = []
+                            safe_slice_cos[slice_name].append(cos_sim)
                         except Exception as e:
-                            print(f"  ✗ Error computing cosine similarity for {name}: {e}")
+                            print(f"  ✗ Error computing cosine similarity for slice {slice_name}: {e}")
+                            continue
 
-                # Cleanup after each sample
-                self._aggressive_cleanup()
-            else:
-                print(f"  ✗ Failed to get gradients")
+        # Average similarities and identify critical slices
+        critical_slices = self.identify_critical_slices(unsafe_slice_cos, safe_slice_cos, threshold=1.0)
 
-        # Average safe cosine similarities
-        if valid_safe > 0:
-            for name in safe_row_cos:
-                safe_row_cos[name] /= valid_safe
-                safe_col_cos[name] /= valid_safe
-            print(f"✓ Successfully processed {valid_safe}/{len(safe_samples)} safe samples for similarities")
-        else:
-            print("ERROR: No valid similarities computed from safe samples")
+        print(f"Found {len(critical_slices)} safety-critical parameter slices out of {len(sliced_reference_gradients)} total slices")
+        print(f"Critical slice ratio: {len(critical_slices)/len(sliced_reference_gradients)*100:.1f}%")
 
-        print("Computing cosine similarity gaps...")
+        return sliced_reference_gradients, critical_slices, {}  # Return empty dict for compatibility
 
-        # Calculate cosine similarity gaps (unsafe - safe)
-        row_cosine_gaps = {}
-        col_cosine_gaps = {}
-
-        for name in unsafe_row_cos:
-            if name in safe_row_cos:
-                row_cosine_gaps[name] = unsafe_row_cos[name] - safe_row_cos[name]
-                col_cosine_gaps[name] = unsafe_col_cos[name] - safe_col_cos[name]
-
-        print(f"Found {len(reference_gradients)} safety-critical parameters")
-
-        return reference_gradients, row_cosine_gaps, col_cosine_gaps
-
-    def compute_safety_score(self, sample, reference_gradients, row_cosine_gaps, col_cosine_gaps, use_cache=True):
+    def compute_safety_score(self, sample, reference_gradients, critical_slices, col_cosine_gaps=None, use_cache=True):
         """
-        Compute safety score for a single sample with efficient caching
+        Compute safety score using only critical slices as per GradSafe paper
 
         Args:
             sample: Sample to evaluate (dict with 'txt' and 'img' keys)
-            reference_gradients: Reference gradients from unsafe samples
-            row_cosine_gaps: Row-wise cosine similarity gaps
-            col_cosine_gaps: Column-wise cosine similarity gaps
+            reference_gradients: Sliced reference gradients from unsafe samples
+            critical_slices: Dictionary of critical parameter slices
+            col_cosine_gaps: Unused (kept for compatibility)
             use_cache: Whether to use caching for scores
 
         Returns:
@@ -685,61 +689,52 @@ class GradSafeLLaVA:
                 print("Warning: No reference gradients provided")
                 return 0.0
 
-            # Compute gradients for the sample (don't cache gradients, they're too big)
+            # Compute gradients for the sample and slice them
             gradients = self._process_sample_for_gradient(sample, "Sure", use_cache=False)
 
             if not gradients:
                 return 0.0
 
+            # Slice the gradients as per GradSafe paper
+            sliced_gradients = self.slice_gradients(gradients)
+
         except Exception as e:
             print(f"Error in compute_safety_score setup: {e}")
             return 0.0
 
-        # Collect cosine similarities for safety-critical parameters
-        cosine_similarities = []
+        # Compute similarities only for critical slices as per GradSafe paper
+        critical_similarities = []
 
-        for name, grad in gradients.items():
-            if name in reference_gradients:
-                ref_grad = reference_gradients[name]
+        for slice_name in critical_slices:
+            if slice_name in sliced_gradients and slice_name in reference_gradients:
+                slice_grad = sliced_gradients[slice_name]
+                ref_slice = reference_gradients[slice_name]
 
-                # Ensure both gradients are on CPU
-                if grad.device != ref_grad.device:
-                    grad = grad.cpu()
-                    ref_grad = ref_grad.cpu()
+                # Ensure both are on CPU
+                if slice_grad.device != ref_slice.device:
+                    slice_grad = slice_grad.cpu()
+                    ref_slice = ref_slice.cpu()
 
                 try:
-                    # Compute cosine similarities
-                    row_cos = torch.nan_to_num(F.cosine_similarity(grad, ref_grad, dim=1))
-                    col_cos = torch.nan_to_num(F.cosine_similarity(grad, ref_grad, dim=0))
-
-                    # Use gaps to identify safety-critical regions
-                    if name in row_cosine_gaps:
-                        ref_row = row_cosine_gaps[name]
-                        ref_col = col_cosine_gaps[name]
-
-                        # Only include similarities for regions with significant gaps (threshold > 1)
-                        try:
-                            cosine_similarities.extend(row_cos[ref_row > 1].cpu().tolist())
-                            cosine_similarities.extend(col_cos[ref_col > 1].cpu().tolist())
-                        except:
-                            # Fallback: use all similarities if indexing fails
-                            cosine_similarities.extend(row_cos.cpu().tolist())
-                            cosine_similarities.extend(col_cos.cpu().tolist())
+                    # Compute cosine similarity for this critical slice
+                    cos_sim = F.cosine_similarity(
+                        slice_grad.unsqueeze(0),
+                        ref_slice.unsqueeze(0)
+                    ).item()
+                    critical_similarities.append(cos_sim)
                 except Exception as e:
-                    print(f"Error computing cosine similarity for {name}: {e}")
+                    print(f"Error computing cosine similarity for slice {slice_name}: {e}")
                     continue
 
-        # Average all cosine similarities as the final safety score
-        if cosine_similarities:
-            raw_score = sum(cosine_similarities) / len(cosine_similarities)
-            # Apply sigmoid normalization to map to [0, 1] range for better threshold calibration
-            safety_score = 1 / (1 + math.exp(-raw_score * 20))  # Scale by 20 for better sensitivity
+        # Simple average as per GradSafe paper (no sigmoid normalization)
+        if critical_similarities:
+            safety_score = sum(critical_similarities) / len(critical_similarities)
         else:
-            safety_score = 0.5  # Neutral score when no similarities found
+            safety_score = 0.0  # No critical similarities found
 
-        # Cache both cosine similarities and final score if enabled
+        # Cache critical similarities and final score if enabled
         if use_cache:
-            self._save_cosine_similarities_to_cache(sample_hash, cosine_similarities)
+            self._save_cosine_similarities_to_cache(sample_hash, critical_similarities)
             self._save_safety_score_to_cache(sample_hash, safety_score)
 
         # Cleanup after computation
