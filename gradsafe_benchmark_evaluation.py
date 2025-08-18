@@ -185,7 +185,7 @@ class BenchmarkEvaluator:
 
         return optimal_threshold, best_f1
 
-    def compute_metrics(self, true_labels, predictions, scores, threshold_used=0.25):
+    def compute_metrics(self, true_labels, predictions, scores, threshold_used=0.5):
         """Compute evaluation metrics with threshold optimization"""
         # Basic classification metrics with given threshold
         accuracy = accuracy_score(true_labels, predictions)
