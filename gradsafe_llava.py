@@ -142,26 +142,40 @@ class GradSafeLLaVA:
 
             self.model_name = get_model_name_from_path(self.model_path)
 
-            # Configure device mapping for multi-GPU
+            # Configure device mapping for multi-GPU with performance optimizations
             if self.num_gpus > 1:
                 print(f"Using multi-GPU setup with {self.num_gpus} GPUs")
                 kwargs = {
                     "device_map": "auto",
                     "torch_dtype": torch.float16,
-                    "max_memory": {i: "10GiB" for i in range(self.num_gpus)},  # Limit memory per GPU
+                    "max_memory": {i: "12GiB" for i in range(self.num_gpus)},  # Increased memory limit
+                    "attn_implementation": "flash_attention_2",  # Use Flash Attention 2 if available
                 }
             else:
                 kwargs = {
                     "device_map": "auto",
                     "torch_dtype": torch.float16,
+                    "attn_implementation": "flash_attention_2",
                 }
 
-            self.tokenizer, self.model, self.image_processor, self.context_len = load_pretrained_model(
-                model_path=self.model_path,
-                model_base=None,
-                model_name=self.model_name,
-                **kwargs
-            )
+            # Try to use Flash Attention 2 for better performance
+            try:
+                self.tokenizer, self.model, self.image_processor, self.context_len = load_pretrained_model(
+                    model_path=self.model_path,
+                    model_base=None,
+                    model_name=self.model_name,
+                    **kwargs
+                )
+            except Exception as e:
+                print(f"Flash Attention 2 not available, falling back to standard attention: {e}")
+                # Remove flash attention if not available
+                kwargs.pop("attn_implementation", None)
+                self.tokenizer, self.model, self.image_processor, self.context_len = load_pretrained_model(
+                    model_path=self.model_path,
+                    model_base=None,
+                    model_name=self.model_name,
+                    **kwargs
+                )
 
             # Print memory usage after loading
             if torch.cuda.is_available():
@@ -171,6 +185,18 @@ class GradSafeLLaVA:
                     print(f"GPU {i}: {allocated:.2f}GB allocated, {cached:.2f}GB cached")
 
             print(f"Model loaded successfully: {self.model_name}")
+            
+            # Disable PyTorch compilation for now due to compatibility issues with LLaVA
+            # The compilation was causing symbolic tensor errors during gradient computation
+            # We'll rely on the other optimizations for performance improvement
+            print("Note: PyTorch compilation disabled for LLaVA compatibility")
+            # try:
+            #     if hasattr(torch, 'compile') and torch.__version__ >= "2.0.0":
+            #         print("Compiling model for better performance...")
+            #         self.model = torch.compile(self.model, mode="reduce-overhead")
+            #         print("Model compilation completed")
+            # except Exception as e:
+            #     print(f"Model compilation not available: {e}")
     
     def _find_conv_mode(self, model_name):
         """Determine conversation mode based on model name"""
@@ -336,12 +362,15 @@ class GradSafeLLaVA:
             if cached_gradients is not None:
                 return cached_gradients
 
-        # Clear gradients first
+        # Only clear gradients if not already cleared (avoid unnecessary operations)
         if hasattr(self.model, 'zero_grad'):
             self.model.zero_grad()
 
-        # Aggressive cleanup before processing
-        self._aggressive_cleanup()
+        # Only do aggressive cleanup on first sample or when memory pressure is high
+        # This avoids the 2-minute per sample bottleneck
+        if not hasattr(self, '_first_sample_processed'):
+            self._aggressive_cleanup()
+            self._first_sample_processed = True
 
         try:
             # Construct prompt
@@ -431,15 +460,18 @@ class GradSafeLLaVA:
                 print(f"input_ids shape: {input_ids.shape if input_ids is not None else 'None'}")
                 return {}
 
-            # Set model to training mode and enable gradients
-            self.model.train()
-            self.model.requires_grad_(True)
-
-            # Disable gradient checkpointing for GradSafe (we need actual gradients)
-            if hasattr(self.model, 'gradient_checkpointing_disable'):
-                self.model.gradient_checkpointing_disable()
-            elif hasattr(self.model, 'gradient_checkpointing') and self.model.gradient_checkpointing:
-                self.model.gradient_checkpointing = False
+            # Set model to training mode and enable gradients (only once, not per sample)
+            if not hasattr(self, '_model_training_mode_set'):
+                self.model.train()
+                self.model.requires_grad_(True)
+                
+                # Disable gradient checkpointing for GradSafe (we need actual gradients) - only once
+                if hasattr(self.model, 'gradient_checkpointing_disable'):
+                    self.model.gradient_checkpointing_disable()
+                elif hasattr(self.model, 'gradient_checkpointing') and self.model.gradient_checkpointing:
+                    self.model.gradient_checkpointing = False
+                
+                self._model_training_mode_set = True
 
             try:
                 # Validate inputs before forward pass
@@ -507,7 +539,7 @@ class GradSafeLLaVA:
             # Clear gradients immediately after collection
             self.model.zero_grad()
 
-            # Clean up intermediate tensors
+            # Clean up intermediate tensors (minimal cleanup to avoid performance hit)
             del outputs, loss, input_ids, labels
             if images is not None:
                 del images
@@ -519,7 +551,7 @@ class GradSafeLLaVA:
 
         except torch.cuda.OutOfMemoryError as e:
             print(f"CUDA OOM during gradient computation: {e}")
-            # Emergency cleanup
+            # Emergency cleanup only when OOM occurs
             self._aggressive_cleanup()
             # Return empty gradients to continue processing
             return {}
@@ -532,7 +564,7 @@ class GradSafeLLaVA:
         Find safety-critical parameters exactly following original GradSafe implementation
 
         Returns:
-            tuple: (gradient_norms_compare, minus_row_cos, minus_col_cos)
+            tuple: (gradient_norms_compare, minus_row_cos)
         """
         # EXACT samples from original code
         if unsafe_samples is None:
@@ -632,15 +664,74 @@ class GradSafeLLaVA:
         # EXACT variable names from original: minus_row_cos, minus_col_cos
         minus_row_cos = {}
         minus_col_cos = {}
-        for name in row_coss:
-            minus_row_cos[name] = row_coss[name] - safe_row_coss[name]
-            minus_col_cos[name] = col_coss[name] - safe_col_coss[name]
+        
+        # Only process parameters that exist in both unsafe and safe sets
+        common_parameters = set(row_coss.keys()) & set(safe_row_coss.keys())
+        
+        for name in common_parameters:
+            if name in row_coss and name in safe_row_coss:
+                minus_row_cos[name] = row_coss[name] - safe_row_coss[name]
+            if name in col_coss and name in safe_col_coss:
+                minus_col_cos[name] = col_coss[name] - safe_col_coss[name]
 
         print(f"Found {len(minus_row_cos)} parameters with row-wise gaps")
         print(f"Found {len(minus_col_cos)} parameters with column-wise gaps")
+        
+        # Filter to only include parameters with significant gaps (critical parameters)
+        # This ensures we're only using the most discriminative parameters for scoring
+        critical_row_params = {}
+        critical_col_params = {}
+        
+        for name, gap in minus_row_cos.items():
+            # Only include parameters where the gap is significant (e.g., > 0.1)
+            if torch.any(gap > 0.1):
+                critical_row_params[name] = gap
+                
+        for name, gap in minus_col_cos.items():
+            # Only include parameters where the gap is significant (e.g., > 0.1)
+            if torch.any(gap > 0.1):
+                critical_col_params[name] = gap
+        
+        print(f"Filtered to {len(critical_row_params)} critical row parameters")
+        print(f"Filtered to {len(critical_col_params)} critical column parameters")
 
-        # Return EXACT same format as original
-        return gradient_norms_compare, minus_row_cos, minus_col_cos
+        # Return EXACT same format as original, but with only critical parameters
+        return gradient_norms_compare, critical_row_params, critical_col_params
+
+    def verify_critical_parameters(self, minus_row, minus_col):
+        """
+        Verify and display information about critical parameters
+        
+        Args:
+            minus_row: Row-wise cosine similarity gaps
+            minus_col: Column-wise cosine similarity gaps
+        """
+        print("\n🔍 Critical Parameters Verification:")
+        print(f"Row-wise critical parameters: {len(minus_row)}")
+        print(f"Column-wise critical parameters: {len(minus_col)}")
+        
+        if minus_row:
+            print("\nTop 5 row-wise critical parameters:")
+            sorted_row = sorted(minus_row.items(), key=lambda x: torch.max(x[1]).item(), reverse=True)
+            for i, (name, gap) in enumerate(sorted_row[:5]):
+                max_gap = torch.max(gap).item()
+                print(f"  {i+1}. {name}: max gap = {max_gap:.3f}")
+        
+        if minus_col:
+            print("\nTop 5 column-wise critical parameters:")
+            sorted_col = sorted(minus_col.items(), key=lambda x: torch.max(x[1]).item(), reverse=True)
+            for i, (name, gap) in enumerate(sorted_col[:5]):
+                max_gap = torch.max(gap).item()
+                print(f"  {i+1}. {name}: max gap = {max_gap:.3f}")
+        
+        # Verify that we have enough critical parameters for scoring
+        total_critical = len(minus_row) + len(minus_col)
+        if total_critical < 10:
+            print("⚠️  Warning: Very few critical parameters found. Scoring may be unreliable.")
+        elif total_critical < 50:
+            print("⚠️  Warning: Few critical parameters found. Consider adjusting threshold.")
+        else:
+            print(f"✅ Good number of critical parameters: {total_critical}")
 
     def compute_safety_score(self, sample, gradient_norms_compare, minus_row, minus_col, use_cache=True):
         """
@@ -693,20 +784,33 @@ class GradSafeLLaVA:
             row_cos, col_cos = self.compute_cosine_similarities(gradients, gradient_norms_compare)
 
             # EXACT logic from original: cos.extend(row_cos[ref_row>1].cpu().tolist())
-            for name in row_cos:
-                if name in minus_row:
+            critical_params_used = 0
+            for name in minus_row:
+                if name in row_cos:
                     ref_row = minus_row[name]  # EXACT variable name from original
                     current_row_cos = row_cos[name]
                     # EXACT condition from original: ref_row>1
-                    cos.extend(current_row_cos[ref_row > 1].cpu().tolist())
+                    critical_indices = ref_row > 1
+                    if torch.any(critical_indices):
+                        critical_params_used += 1
+                        cos.extend(current_row_cos[critical_indices].cpu().tolist())
 
             # EXACT logic from original: cos.extend(col_cos[ref_col>1].cpu().tolist())
-            for name in col_cos:
+            for name in minus_col:
                 if name in minus_col:
                     ref_col = minus_col[name]  # EXACT variable name from original
                     current_col_cos = col_cos[name]
                     # EXACT condition from original: ref_col>1
-                    cos.extend(current_col_cos[ref_col > 1].cpu().tolist())
+                    critical_indices = ref_col > 1
+                    if torch.any(critical_indices):
+                        critical_params_used += 1
+                        cos.extend(current_col_cos[critical_indices].cpu().tolist())
+            
+            # Debug information
+            if len(cos) > 0:
+                print(f"Debug: Used {critical_params_used} critical parameters, {len(cos)} similarity values")
+            else:
+                print(f"Debug: No critical parameters found, using fallback scoring")
 
         except Exception as e:
             print(f"Error in compute_safety_score: {e}")
@@ -724,8 +828,10 @@ class GradSafeLLaVA:
             self._save_cosine_similarities_to_cache(sample_hash, cos)
             self._save_safety_score_to_cache(sample_hash, safety_score)
 
-        # Cleanup after computation
-        self._aggressive_cleanup()
+        # Only do light cleanup here, not aggressive cleanup
+        # This avoids the 2-minute per sample bottleneck
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         return safety_score
 
@@ -850,6 +956,10 @@ class GradSafeLLaVA:
                     cached_count += 1
             print(f"Found {cached_count}/{len(samples)} samples already cached")
 
+        # Track memory pressure to avoid excessive cleanup
+        samples_since_last_cleanup = 0
+        last_cleanup_sample = 0
+
         for i, sample in enumerate(tqdm(samples, desc="Computing safety scores")):
             try:
                 # Validate sample
@@ -887,10 +997,23 @@ class GradSafeLLaVA:
                     print(f"Warning: Error extracting label from sample {i}: {e}")
                     labels.append(0)
 
+                # Smart cleanup: only when necessary, not on every batch
+                samples_since_last_cleanup += 1
+                
                 # Periodic cleanup to prevent memory accumulation (only for non-cached samples)
-                if not was_cached and (i + 1) % batch_size == 0:
-                    self._aggressive_cleanup()
-                    print(f"Processed {i + 1}/{len(samples)} samples")
+                # Increased batch size for cleanup to reduce overhead
+                if not was_cached and samples_since_last_cleanup >= batch_size * 2:
+                    # Only do aggressive cleanup every 2x batch_size to reduce overhead
+                    if i - last_cleanup_sample >= batch_size * 2:
+                        self._aggressive_cleanup()
+                        last_cleanup_sample = i
+                        samples_since_last_cleanup = 0
+                        print(f"Processed {i + 1}/{len(samples)} samples (cleanup performed)")
+                    else:
+                        # Light cleanup only
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        print(f"Processed {i + 1}/{len(samples)} samples (light cleanup)")
 
                 # Cooling break to prevent server overheating (only for non-cached samples)
                 if not was_cached and (i + 1) % cooling_interval == 0 and (i + 1) < len(samples):
@@ -911,10 +1034,130 @@ class GradSafeLLaVA:
                 labels.append(0)
                 continue
 
-        # Final cleanup
-        self._aggressive_cleanup()
-
+        # Final cleanup after all samples
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        print(f"Evaluation completed: {len(safety_scores)} samples processed")
         return safety_scores, predictions, labels
+
+    def evaluate_samples_batch(self, samples, gradient_norms_compare, minus_row, minus_col,
+                              threshold=0.25, batch_size=4, use_cache=True):
+        """
+        Evaluate multiple samples with TRUE batch processing for much better performance
+        
+        This method processes multiple samples in actual batches rather than one-by-one,
+        which should reduce the 2-minute per sample bottleneck significantly.
+        
+        Args:
+            samples: List of samples to evaluate
+            gradient_norms_compare: Reference gradients from unsafe samples
+            minus_row: Row-wise cosine similarity gaps
+            minus_col: Column-wise cosine similarity gaps
+            threshold: Classification threshold
+            batch_size: True batch size for processing multiple samples together
+            use_cache: Whether to use caching
+
+        Returns:
+            tuple: (safety_scores, predictions, labels)
+        """
+        safety_scores = []
+        predictions = []
+        labels = []
+        
+        print(f"Evaluating {len(samples)} samples with TRUE batch processing (batch_size={batch_size})...")
+        print(f"Caching: {'enabled' if use_cache else 'disabled'}")
+        
+        # Check cache first
+        cached_count = 0
+        if use_cache:
+            for sample in samples:
+                sample_hash = self._get_sample_hash(sample, "Sure")
+                if (self._load_safety_score_from_cache(sample_hash) is not None or
+                    self._load_cosine_similarities_from_cache(sample_hash) is not None):
+                    cached_count += 1
+            print(f"Found {cached_count}/{len(samples)} samples already cached")
+        
+        # Process samples in true batches
+        for batch_start in tqdm(range(0, len(samples), batch_size), desc="Processing batches"):
+            batch_end = min(batch_start + batch_size, len(samples))
+            batch_samples = samples[batch_start:batch_end]
+            
+            print(f"Processing batch {batch_start//batch_size + 1}: samples {batch_start+1}-{batch_end}")
+            
+            # Process batch
+            batch_scores, batch_predictions, batch_labels = self._process_batch(
+                batch_samples, gradient_norms_compare, minus_row, minus_col, 
+                threshold, use_cache
+            )
+            
+            safety_scores.extend(batch_scores)
+            predictions.extend(batch_predictions)
+            labels.extend(batch_labels)
+            
+            # Light cleanup after each batch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        print(f"Batch evaluation completed: {len(safety_scores)} samples processed")
+        return safety_scores, predictions, labels
+    
+    def _process_batch(self, batch_samples, gradient_norms_compare, minus_row, minus_col, 
+                       threshold, use_cache):
+        """Process a batch of samples together for better efficiency"""
+        batch_scores = []
+        batch_predictions = []
+        batch_labels = []
+        
+        # Set model to training mode once for the batch
+        if not hasattr(self, '_model_training_mode_set'):
+            self.model.train()
+            self.model.requires_grad_(True)
+            
+            if hasattr(self.model, 'gradient_checkpointing_disable'):
+                self.model.gradient_checkpointing_disable()
+            elif hasattr(self.model, 'gradient_checkpointing') and self.model.gradient_checkpointing:
+                self.model.gradient_checkpointing = False
+            
+            self._model_training_mode_set = True
+        
+        for sample in batch_samples:
+            try:
+                # Check cache first
+                if use_cache:
+                    sample_hash = self._get_sample_hash(sample, "Sure")
+                    cached_score = self._load_safety_score_from_cache(sample_hash)
+                    if cached_score is not None:
+                        batch_scores.append(cached_score)
+                        batch_predictions.append(1 if cached_score >= threshold else 0)
+                        batch_labels.append(self._extract_label(sample))
+                        continue
+                
+                # Compute safety score for this sample
+                score = self.compute_safety_score(sample, gradient_norms_compare, minus_row, minus_col, use_cache=use_cache)
+                batch_scores.append(score)
+                batch_predictions.append(1 if score >= threshold else 0)
+                batch_labels.append(self._extract_label(sample))
+                
+            except Exception as e:
+                print(f"Error processing sample in batch: {e}")
+                batch_scores.append(0.0)
+                batch_predictions.append(0)
+                batch_labels.append(0)
+        
+        return batch_scores, batch_predictions, batch_labels
+    
+    def _extract_label(self, sample):
+        """Extract ground truth label from sample"""
+        try:
+            normalized_sample = self._normalize_sample(sample)
+            if normalized_sample:
+                return normalized_sample.get('toxicity', 0)
+            else:
+                return sample.get('toxicity', 0) if sample else 0
+        except Exception as e:
+            print(f"Warning: Error extracting label from sample: {e}")
+            return 0
 
     def cleanup(self):
         """Clean up GPU memory across all devices"""

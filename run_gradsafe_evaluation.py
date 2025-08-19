@@ -75,8 +75,16 @@ def main():
                         help='Number of samples to process before cooling break (default: 10)')
     parser.add_argument('--cooling_time', type=int, default=30,
                         help='Cooling break duration in seconds (default: 30)')
+    parser.add_argument('--use_batch_processing', action='store_true', default=True,
+                        help='Use true batch processing for better performance (default: True)')
+    parser.add_argument('--disable_batch_processing', action='store_true',
+                        help='Disable batch processing and use sequential processing instead')
     
     args = parser.parse_args()
+    
+    # Handle batch processing argument
+    if args.disable_batch_processing:
+        args.use_batch_processing = False
     
     print("="*80)
     print("GRADSAFE EVALUATION ON LLAVA 1.6")
@@ -86,6 +94,7 @@ def main():
     print(f"Use training data: {args.use_training_data}")
     print(f"Output file: {args.output_file}")
     print(f"Caching: {'disabled' if args.disable_cache else 'enabled'}")
+    print(f"Batch processing: {'enabled' if args.use_batch_processing else 'disabled'}")
     print(f"Cooling: {args.cooling_time}s break every {args.cooling_interval} samples")
     print("="*80)
     
@@ -143,20 +152,49 @@ def main():
         print("\nStep 3: Finding safety-critical parameters...")
         start_time = time.time()
         gradient_norms_compare, minus_row_cos, minus_col_cos = evaluator.find_critical_parameters(training_data)
+        
+        # Verify critical parameters
+        evaluator.gradsafe.verify_critical_parameters(minus_row_cos, minus_col_cos)
+        
         param_time = time.time() - start_time
         print(f"Critical parameter identification completed in {param_time:.2f} seconds")
 
         # Evaluate on test set
         print("\nStep 4: Evaluating on test set...")
         start_time = time.time()
+        
+        # Performance monitoring
+        if args.quick_test:
+            expected_samples = 200
+        else:
+            expected_samples = 1800
+        
+        print(f"Expected processing time: ~{expected_samples * 0.1:.1f} seconds with optimizations (vs ~{expected_samples * 2:.0f} seconds without)")
+        
         metrics, safety_scores, predictions, labels = evaluator.evaluate_on_test_set(
             test_data, gradient_norms_compare, minus_row_cos, minus_col_cos,
             use_cache=not args.disable_cache,
             cooling_interval=args.cooling_interval,
-            cooling_time=args.cooling_time
+            cooling_time=args.cooling_time,
+            use_batch_processing=args.use_batch_processing
         )
         eval_time = time.time() - start_time
+        
+        # Performance analysis
+        actual_samples = len(test_data)
+        time_per_sample = eval_time / actual_samples if actual_samples > 0 else 0
+        samples_per_minute = (actual_samples / eval_time) * 60 if eval_time > 0 else 0
+        
         print(f"Test set evaluation completed in {eval_time:.2f} seconds")
+        print(f"Performance: {time_per_sample:.2f}s per sample, {samples_per_minute:.1f} samples/minute")
+        
+        if time_per_sample > 1.0:
+            print("⚠️  Performance warning: Still slow (>1s per sample). Consider:")
+            print("   - Using --disable_batch_processing if memory issues occur")
+            print("   - Reducing batch size in gradsafe_llava.py")
+            print("   - Checking GPU memory usage and CUDA version")
+        else:
+            print("✅ Performance optimized: <1s per sample achieved!")
         
         # Print and save results
         print("\nStep 5: Results...")

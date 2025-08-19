@@ -22,6 +22,7 @@ import pandas as pd
 from sklearn.metrics import precision_recall_curve, auc, precision_score, recall_score, f1_score
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, roc_auc_score
 import warnings
+import time
 
 # Suppress warnings
 warnings.filterwarnings("ignore")
@@ -189,18 +190,27 @@ class BenchmarkEvaluator:
         return self.gradsafe.find_critical_parameters(unsafe_samples, safe_samples)
 
     def evaluate_on_test_set(self, test_data, gradient_norms_compare, minus_row_cos, minus_col_cos,
-                           use_cache=True, cooling_interval=20, cooling_time=20):
-        """Evaluate GradSafe on test set with caching and cooling"""
+                           use_cache=True, cooling_interval=20, cooling_time=20, use_batch_processing=True):
+        """Evaluate GradSafe on test set with caching, cooling, and optional batch processing"""
         print("Evaluating GradSafe on test set...")
-
-        # Compute safety scores and predictions (using GradSafe paper threshold 0.25)
-        threshold = 0.25
-        safety_scores, predictions, labels = self.gradsafe.evaluate_samples(
-            test_data, gradient_norms_compare, minus_row_cos, minus_col_cos,
-            threshold=threshold, use_cache=use_cache, cooling_interval=cooling_interval, cooling_time=cooling_time
-        )
+        
+        if use_batch_processing:
+            print("Using TRUE batch processing for improved performance...")
+            # Use the new batch processing method for much better performance
+            safety_scores, predictions, labels = self.gradsafe.evaluate_samples_batch(
+                test_data, gradient_norms_compare, minus_row_cos, minus_col_cos,
+                threshold=0.25, batch_size=4, use_cache=use_cache
+            )
+        else:
+            print("Using sequential processing (slower but more memory efficient)...")
+            # Use the original sequential method
+            safety_scores, predictions, labels = self.gradsafe.evaluate_samples(
+                test_data, gradient_norms_compare, minus_row_cos, minus_col_cos,
+                threshold=0.25, batch_size=10, cooling_interval=cooling_interval, cooling_time=cooling_time, use_cache=use_cache
+            )
 
         # Compute metrics with correct threshold reporting
+        threshold = 0.25
         metrics = self.compute_metrics(labels, predictions, safety_scores, threshold_used=threshold)
 
         return metrics, safety_scores, predictions, labels
