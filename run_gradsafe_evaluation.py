@@ -152,10 +152,7 @@ def main():
         print("\nStep 3: Finding safety-critical parameters...")
         start_time = time.time()
         gradient_norms_compare, minus_row_cos, minus_col_cos = evaluator.find_critical_parameters(training_data)
-        
-        # Verify critical parameters
-        evaluator.gradsafe.verify_critical_parameters(minus_row_cos, minus_col_cos)
-        
+
         param_time = time.time() - start_time
         print(f"Critical parameter identification completed in {param_time:.2f} seconds")
 
@@ -171,7 +168,7 @@ def main():
         
         print(f"Expected processing time: ~{expected_samples * 0.1:.1f} seconds with optimizations (vs ~{expected_samples * 2:.0f} seconds without)")
         
-        metrics, safety_scores, predictions, labels = evaluator.evaluate_on_test_set(
+        metrics, scores, predictions, labels = evaluator.evaluate_on_test_set(
             test_data, gradient_norms_compare, minus_row_cos, minus_col_cos,
             use_cache=not args.disable_cache,
             cooling_interval=args.cooling_interval,
@@ -198,8 +195,8 @@ def main():
         
         # Print and save results
         print("\nStep 5: Results...")
-        evaluator.print_results(metrics)
-        evaluator.save_results(metrics, args.output_file)
+        evaluator.print_results(metrics, test_data, predictions, scores)
+        evaluator.save_results(metrics, args.output_file, test_data, predictions, scores)
         
         # Print timing summary
         total_time = load_time + init_time + param_time + eval_time

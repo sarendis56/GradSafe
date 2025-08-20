@@ -109,6 +109,12 @@ class BenchmarkEvaluator:
             xstest_safe = [sample for sample in xstest_data if sample['toxicity'] == 0][:100]
             xstest_unsafe = [sample for sample in xstest_data if sample['toxicity'] == 1][:100]
 
+            # Add dataset source labels for detailed analysis
+            for sample in xstest_safe:
+                sample['dataset_source'] = 'XSTest_Safe'
+            for sample in xstest_unsafe:
+                sample['dataset_source'] = 'XSTest_Unsafe'
+
             print(f"Loaded {len(xstest_safe)} safe test samples (XSTest)")
             print(f"Loaded {len(xstest_unsafe)} unsafe test samples (XSTest)")
 
@@ -128,11 +134,17 @@ class BenchmarkEvaluator:
             print("Loading safe test data...")
             xstest_data = load_XSTest()
             xstest_safe = [sample for sample in xstest_data if sample['toxicity'] == 0][:250]
+            for sample in xstest_safe:
+                sample['dataset_source'] = 'XSTest_Safe'
 
             figtxt_data = load_FigTxt()
             figtxt_safe = [sample for sample in figtxt_data if sample['toxicity'] == 0][:300]
+            for sample in figtxt_safe:
+                sample['dataset_source'] = 'FigTxt_Safe'
 
             vqav2_data = load_vqav2(max_samples=350)
+            for sample in vqav2_data:
+                sample['dataset_source'] = 'VQAv2'
 
             safe_test = xstest_safe + figtxt_safe + vqav2_data
             print(f"Loaded {len(safe_test)} safe test samples")
@@ -140,12 +152,20 @@ class BenchmarkEvaluator:
             # Unsafe test data (900 total)
             print("Loading unsafe test data...")
             xstest_unsafe = [sample for sample in xstest_data if sample['toxicity'] == 1][:200]
+            for sample in xstest_unsafe:
+                sample['dataset_source'] = 'XSTest_Unsafe'
 
             figtxt_unsafe = [sample for sample in figtxt_data if sample['toxicity'] == 1][:350]
+            for sample in figtxt_unsafe:
+                sample['dataset_source'] = 'FigTxt_Unsafe'
 
             vae_data = load_adversarial_img()[:200]
+            for sample in vae_data:
+                sample['dataset_source'] = 'VAE'
 
             jailbreak_figstep_data = load_JailBreakV_figstep(max_samples=150)
+            for sample in jailbreak_figstep_data:
+                sample['dataset_source'] = 'JailbreakV-28K'
 
             unsafe_test = xstest_unsafe + figtxt_unsafe + vae_data + jailbreak_figstep_data
             print(f"Loaded {len(unsafe_test)} unsafe test samples")
@@ -287,9 +307,97 @@ class BenchmarkEvaluator:
         }
 
         return metrics
-    
-    def print_results(self, metrics):
-        """Print evaluation results"""
+
+    def compute_per_dataset_metrics(self, test_data, predictions, scores, threshold=0.25):
+        """Compute accuracy and F1 for each dataset separately"""
+        from sklearn.metrics import accuracy_score, f1_score
+        import numpy as np
+
+        # Group samples by dataset source
+        dataset_groups = {}
+        for i, sample in enumerate(test_data):
+            dataset = sample.get('dataset_source', 'Unknown')
+            if dataset not in dataset_groups:
+                dataset_groups[dataset] = {'indices': [], 'labels': [], 'predictions': [], 'scores': []}
+
+            dataset_groups[dataset]['indices'].append(i)
+            dataset_groups[dataset]['labels'].append(sample.get('toxicity', 0))
+            dataset_groups[dataset]['predictions'].append(predictions[i])
+            dataset_groups[dataset]['scores'].append(scores[i])
+
+        # Compute metrics for each dataset
+        per_dataset_metrics = {}
+        for dataset, data in dataset_groups.items():
+            labels = np.array(data['labels'])
+            preds = np.array(data['predictions'])
+
+            accuracy = accuracy_score(labels, preds)
+            f1 = f1_score(labels, preds, zero_division=0)
+
+            per_dataset_metrics[dataset] = {
+                'accuracy': float(accuracy),  # Convert to Python float for JSON serialization
+                'f1_score': float(f1),
+                'sample_count': int(len(labels)),  # Convert to Python int
+                'positive_count': int(np.sum(labels)),
+                'negative_count': int(len(labels) - np.sum(labels)),
+                'true_positive_rate': float(np.sum((labels == 1) & (preds == 1)) / max(np.sum(labels == 1), 1)),
+                'true_negative_rate': float(np.sum((labels == 0) & (preds == 0)) / max(np.sum(labels == 0), 1))
+            }
+
+        return per_dataset_metrics
+
+    def compute_dataset_pair_metrics(self, test_data, scores):
+        """Compute AUROC and AUPRC for specific dataset pairs"""
+        from sklearn.metrics import roc_auc_score, average_precision_score
+        import numpy as np
+
+        # Group samples by dataset source
+        dataset_groups = {}
+        for i, sample in enumerate(test_data):
+            dataset = sample.get('dataset_source', 'Unknown')
+            if dataset not in dataset_groups:
+                dataset_groups[dataset] = {'indices': [], 'labels': [], 'scores': []}
+
+            dataset_groups[dataset]['indices'].append(i)
+            dataset_groups[dataset]['labels'].append(sample.get('toxicity', 0))
+            dataset_groups[dataset]['scores'].append(scores[i])
+
+        # Define dataset pairs for comparison (as requested)
+        dataset_pairs = [
+            ('XSTest_Safe', 'XSTest_Unsafe'),
+            ('FigTxt_Safe', 'FigTxt_Unsafe'),
+            ('VAE', 'VQAv2'),
+            ('JailbreakV-28K', 'VQAv2')
+        ]
+
+        pair_metrics = {}
+        for safe_dataset, unsafe_dataset in dataset_pairs:
+            if safe_dataset in dataset_groups and unsafe_dataset in dataset_groups:
+                # Combine safe (label=0) and unsafe (label=1) samples
+                safe_data = dataset_groups[safe_dataset]
+                unsafe_data = dataset_groups[unsafe_dataset]
+
+                combined_labels = np.array(safe_data['labels'] + unsafe_data['labels'])
+                combined_scores = np.array(safe_data['scores'] + unsafe_data['scores'])
+
+                # Compute AUROC and AUPRC
+                try:
+                    auroc = roc_auc_score(combined_labels, combined_scores)
+                    auprc = average_precision_score(combined_labels, combined_scores)
+
+                    pair_metrics[f"{safe_dataset} vs {unsafe_dataset}"] = {
+                        'auroc': float(auroc),  # Convert to Python float for JSON serialization
+                        'auprc': float(auprc),
+                        'safe_count': int(len(safe_data['labels'])),  # Convert to Python int
+                        'unsafe_count': int(len(unsafe_data['labels']))
+                    }
+                except Exception as e:
+                    print(f"Warning: Could not compute metrics for {safe_dataset} vs {unsafe_dataset}: {e}")
+
+        return pair_metrics
+
+    def print_results(self, metrics, test_data=None, predictions=None, scores=None):
+        """Print evaluation results with detailed per-dataset and pair analysis"""
         print("\n" + "="*70)
         print("GRADSAFE EVALUATION RESULTS")
         print("="*70)
@@ -312,10 +420,49 @@ class BenchmarkEvaluator:
         print(f"\nTHRESHOLD-INDEPENDENT METRICS:")
         print(f"  ROC AUC:            {metrics['roc_auc']:.4f}")
         print(f"  PR AUC:             {metrics['pr_auc']:.4f}")
+
+        # Add detailed per-dataset and pair analysis if data is provided
+        if test_data is not None and predictions is not None and scores is not None:
+            print("\n" + "="*70)
+            print("PER-DATASET PERFORMANCE")
+            print("="*70)
+
+            per_dataset_metrics = self.compute_per_dataset_metrics(test_data, predictions, scores)
+            for dataset, dataset_metrics in per_dataset_metrics.items():
+                print(f"{dataset}:")
+
+                # For pure safe/unsafe datasets, show detection rates instead of accuracy/F1
+                if dataset_metrics['positive_count'] == 0:  # Pure safe dataset
+                    print(f"  True Negative Rate: {dataset_metrics['true_negative_rate']:.4f} (correctly identified as safe)")
+                    print(f"  False Positive Rate: {1 - dataset_metrics['true_negative_rate']:.4f} (incorrectly flagged as unsafe)")
+                elif dataset_metrics['negative_count'] == 0:  # Pure unsafe dataset
+                    print(f"  True Positive Rate: {dataset_metrics['true_positive_rate']:.4f} (correctly identified as unsafe)")
+                    print(f"  False Negative Rate: {1 - dataset_metrics['true_positive_rate']:.4f} (incorrectly flagged as safe)")
+                else:  # Mixed dataset
+                    print(f"  Accuracy: {dataset_metrics['accuracy']:.4f}")
+                    print(f"  F1 Score: {dataset_metrics['f1_score']:.4f}")
+
+                print(f"  Samples:  {dataset_metrics['sample_count']} "
+                      f"(Safe: {dataset_metrics['negative_count']}, "
+                      f"Unsafe: {dataset_metrics['positive_count']})")
+                print()
+
+            print("="*70)
+            print("DATASET PAIR COMPARISONS (AUROC/AUPRC)")
+            print("="*70)
+
+            pair_metrics = self.compute_dataset_pair_metrics(test_data, scores)
+            for pair_name, pair_data in pair_metrics.items():
+                print(f"{pair_name}:")
+                print(f"  AUROC: {pair_data['auroc']:.4f}")
+                print(f"  AUPRC: {pair_data['auprc']:.4f}")
+                print(f"  Samples: {pair_data['safe_count']} safe + {pair_data['unsafe_count']} unsafe")
+                print()
+
         print("="*70)
     
-    def save_results(self, metrics, output_file="gradsafe_results.json"):
-        """Save results to file"""
+    def save_results(self, metrics, output_file="gradsafe_results.json", test_data=None, predictions=None, scores=None):
+        """Save results to file with detailed analysis"""
         results = {
             'model_path': self.model_path,
             'random_seed': self.random_seed,
@@ -323,10 +470,15 @@ class BenchmarkEvaluator:
             'method': 'GradSafe',
             'benchmark': 'Vision-Language Safety Benchmark'
         }
-        
+
+        # Add detailed analysis if data is provided
+        if test_data is not None and predictions is not None and scores is not None:
+            results['per_dataset_metrics'] = self.compute_per_dataset_metrics(test_data, predictions, scores)
+            results['dataset_pair_metrics'] = self.compute_dataset_pair_metrics(test_data, scores)
+
         with open(output_file, 'w') as f:
             json.dump(results, f, indent=2)
-        
+
         print(f"Results saved to {output_file}")
     
     def cleanup(self):
