@@ -215,19 +215,14 @@ class BenchmarkEvaluator:
         print("Evaluating GradSafe on test set...")
         
         if use_batch_processing:
-            print("Using TRUE batch processing for improved performance...")
             # Use the new batch processing method for much better performance
             safety_scores, predictions, labels = self.gradsafe.evaluate_samples_batch(
                 test_data, gradient_norms_compare, minus_row_cos, minus_col_cos,
                 threshold=0.25, batch_size=4, use_cache=use_cache
             )
         else:
-            print("Using sequential processing (slower but more memory efficient)...")
-            # Use the original sequential method
-            safety_scores, predictions, labels = self.gradsafe.evaluate_samples(
-                test_data, gradient_norms_compare, minus_row_cos, minus_col_cos,
-                threshold=0.25, batch_size=10, cooling_interval=cooling_interval, cooling_time=cooling_time, use_cache=use_cache
-            )
+            # Error handling and exception
+            raise ValueError("Batch processing failed.")
 
         # Compute metrics with correct threshold reporting
         threshold = 0.25

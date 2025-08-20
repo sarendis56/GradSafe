@@ -165,9 +165,7 @@ def main():
             expected_samples = 200
         else:
             expected_samples = 1800
-        
-        print(f"Expected processing time: ~{expected_samples * 0.1:.1f} seconds with optimizations (vs ~{expected_samples * 2:.0f} seconds without)")
-        
+  
         metrics, scores, predictions, labels = evaluator.evaluate_on_test_set(
             test_data, gradient_norms_compare, minus_row_cos, minus_col_cos,
             use_cache=not args.disable_cache,
